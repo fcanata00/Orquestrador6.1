@@ -64,6 +64,22 @@ if ! type dl_fetch >/dev/null 2>&1; then
   fi
 fi
 # ===============================
+# Integração automática com patches.sh
+# ===============================
+if ! type pt_apply >/dev/null 2>&1; then
+  if [[ -f /usr/bin/patches.sh ]]; then
+    source /usr/bin/patches.sh
+    pt_init || log WARN "Falha ao inicializar patches"
+    log INFO "patches.sh carregado com sucesso"
+  elif [[ -f /mnt/lfs/usr/bin/patches.sh ]]; then
+    source /mnt/lfs/usr/bin/patches.sh
+    pt_init || log WARN "Falha ao inicializar patches (LFS)"
+    log INFO "patches.sh (LFS) carregado com sucesso"
+  else
+    log WARN "patches.sh não encontrado — aplicação de patches será ignorada"
+  fi
+fi
+# ===============================
 # mf_load - carrega um metafile.ini
 # ===============================
 mf_load() {
