@@ -4,7 +4,6 @@ set -eEuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="metafile"
-
 # ===============================
 # CONFIG PADRÃO
 # ===============================
@@ -15,7 +14,6 @@ SCRIPT_NAME="metafile"
 : "${CACHE_BINARIES:=/var/cache/binaries}"
 : "${MF_SILENT:=false}"
 : "${MF_DEBUG:=false}"
-
 # logs básicos ou usa register.sh se disponível
 log() {
   local level="$1"; shift
@@ -49,7 +47,22 @@ safe_mkdir() { mkdir -p "$1" 2>/dev/null || fail "Não foi possível criar diret
 # sanitização básica
 sanitize_key() { echo "$1" | sed -E 's/[^A-Za-z0-9_.-]//g'; }
 sanitize_value() { echo "$1" | sed -E 's/[;`$]//g'; }
-
+# ===============================
+# Integração automática com downloader.sh
+# ===============================
+if ! type dl_fetch >/dev/null 2>&1; then
+  if [[ -f /usr/bin/downloader.sh ]]; then
+    source /usr/bin/downloader.sh
+    dl_init || log WARN "Falha ao inicializar downloader"
+    log INFO "downloader.sh carregado com sucesso"
+  elif [[ -f /mnt/lfs/usr/bin/downloader.sh ]]; then
+    source /mnt/lfs/usr/bin/downloader.sh
+    dl_init || log WARN "Falha ao inicializar downloader (LFS)"
+    log INFO "downloader.sh (LFS) carregado com sucesso"
+  else
+    log WARN "downloader.sh não encontrado — downloads diretos serão usados"
+  fi
+fi
 # ===============================
 # mf_load - carrega um metafile.ini
 # ===============================
@@ -117,24 +130,38 @@ mf_expand_vars() {
 # ===============================
 # mf_fetch_sources - busca os sources
 # ===============================
+# ===============================
+# mf_fetch_sources - busca os sources
+# ===============================
 mf_fetch_sources() {
   [[ -z "${MF_URLS[*]:-}" ]] && { log WARN "Nenhum source definido"; return 0; }
-  safe_mkdir "${CACHE_SOURCES}"
+  safe_mkdir "${CACHE_SOURCES:-/var/cache/sources}"
+  local idx=0
   for url in "${MF_URLS[@]}"; do
     local expanded_url; expanded_url=$(mf_expand_vars "$url")
-    local filename=$(basename "$expanded_url")
-    local dest="${CACHE_SOURCES}/${filename}"
-    if [[ -f "$dest" ]]; then
-      log INFO "Fonte já em cache: $filename"
+    local sha="${MF_SHA256S[$idx]:-}"
+    idx=$((idx+1))
+    if type dl_fetch >/dev/null 2>&1; then
+      # Usa o downloader integrado
+      if ! dl_fetch "$expanded_url" "$sha"; then
+        log ERROR "Falha no download via downloader.sh: $expanded_url"
+        return 1
+      fi
     else
-      log INFO "Baixando: $expanded_url"
-      if ! curl -L --fail --silent --show-error -o "$dest" "$expanded_url"; then
-        fail "Falha no download: $expanded_url"
+      # Fallback para curl se downloader não estiver disponível
+      local filename=$(basename "$expanded_url")
+      local dest="${CACHE_SOURCES}/${filename}"
+      if [[ -f "$dest" ]]; then
+        log INFO "Fonte já em cache: $filename"
+      else
+        log INFO "Baixando: $expanded_url"
+        if ! curl -L --fail --silent --show-error -o "$dest" "$expanded_url"; then
+          fail "Falha no download: $expanded_url"
+        fi
       fi
     fi
   done
 }
-
 # ===============================
 # mf_apply_patches - aplica patches
 # ===============================
@@ -152,7 +179,6 @@ mf_apply_patches() {
     fi
   done
 }
-
 # ===============================
 # mf_environment - exporta variáveis
 # ===============================
@@ -162,7 +188,6 @@ mf_environment() {
     eval "export ${kv}" || log WARN "Variável inválida em Environment: $kv"
   done
 }
-
 # ===============================
 # mf_create - cria metafile exemplo
 # ===============================
