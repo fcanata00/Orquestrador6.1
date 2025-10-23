@@ -1,5 +1,7 @@
 # local dos metas para stages
 # /mnt/lfs/usr/src/repo/bootstrap/stage1.meta
+# Local do Log
+# cat /var/log/orquestrador/bootstrap/stage1/gcc.log
 # stage1.meta - Definição de pacotes do Stage 1 (Toolchain Inicial)
 # Cada pacote possui chaves <nome>.<atributo>
 # A ordem de compilação é crítica.
