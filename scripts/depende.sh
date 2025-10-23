@@ -1,744 +1,840 @@
 #!/usr/bin/env bash
-# depende.sh - Gerenciador de dependências para orquestrador LFS/BLFS
-# - resolve dependências, topological sort, detecta ciclos
-# - integra com build.sh, install.sh, uninstall.sh, update.sh, metafile.sh
-# - DB simples em /var/lib/orquestrador/depends.db e installed.db
-# - locking, backups, logs, tratamento de erros
-#
+# depende.sh - resolução e instalação automática de dependências para Orquestrador LFS
+# - formato packages.db: pacote|versão|depends|build_deps|opt_deps
+# - integrações: metafile.sh (meta_load), build.sh (construir dependências), register.sh (logs)
+# - funcionalidades: resolve, install, check, orphans, rebuild-all, graph export, etc.
 # Versão: 2025-10-23
+
 set -eEuo pipefail
 IFS=$'\n\t'
+umask 027
 
 SCRIPT_NAME="depende"
 SCRIPT_VERSION="1.0.0"
 
-# ----------------------------
-# Configuráveis via ENV
-# ----------------------------
-: "${DEP_BASE:=/var/lib/orquestrador}"
-: "${DEP_DB:=${DEP_BASE}/depends.db}"            # formato: pkg:dep1 dep2 ...
-: "${DEP_INSTALLED:=${DEP_BASE}/installed.db}"   # formato: pkg=version
-: "${DEP_LOCK:=${DEP_BASE}/lock/depende.lock}"
-: "${DEP_BACKUP_DIR:=${DEP_BASE}/backup}"
-: "${DEP_LOG_DIR:=${DEP_BASE}/logs}"
-: "${DEP_SILENT:=false}"
+# -------------------------
+# Configuráveis (ENV)
+# -------------------------
+: "${DB_PATH:=/var/lib/orquestrador/packages.db}"
+: "${DB_LOCK_DIR:=/run/lock/orquestrador}"
+: "${DB_BACKUP_DIR:=/var/lib/orquestrador/backups}"
+: "${DB_RETENTION:=10}"
+: "${DEP_CACHE_DIR:=/var/cache/orquestrador/deps}"
+: "${GRAPH_DIR:=/var/lib/orquestrador/graphs}"
+: "${BUILD_CMD:="/usr/bin/build.sh"}"
+: "${META_CMD:="/usr/bin/metafile.sh"}"
+: "${REGISTER_IF_PRESENT:=true}"
 : "${DEP_DEBUG:=false}"
-: "${DEP_FLOCK_TIMEOUT:=600}"   # 10 minutes for global lock
-: "${DEP_AUTO_INSTALL_CMD:=install.sh}"   # command used by dep_auto_install
-: "${DEP_AUTO_BUILD_CMD:=build.sh}"       # command used by dep_auto_build
-: "${DEP_MAX_RECURSION:=1000}"
+: "${DEP_SILENT:=false}"
+: "${DEP_FAIL_ON_MISSING:=false}"   # if true, abort when missing metafile for a dep
+: "${DEP_VIRTUAL_MAP:=}"            # file path to map virtual names -> comma list (optional)
 
-# Internal
-declare -A _DEP_GRAPH        # adjacency list: pkg -> "dep1 dep2 ..."
-declare -A _DEP_REVGRAPH    # reverse edges: pkg -> "pkg_that_depends_on_me ..."
-declare -A _INSTALLED_VER   # installed pkg -> version
-_DEP_LOADED=false
+mkdir -p "$(dirname "${DB_PATH}")" "${DB_LOCK_DIR}" "${DB_BACKUP_DIR}" "${DEP_CACHE_DIR}" "${GRAPH_DIR}" 2>/dev/null || true
 
-# ----------------------------
-# Logging helpers
-# ----------------------------
-_dep_log() {
-  local level="$1"; shift
+# runtime
+_SESSION_TS="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
+_DB_LOCK_FD=""
+
+# -------------------------
+# Logging helpers (register.sh integration if available)
+# -------------------------
+_dlog() {
+  local lvl="$1"; shift
   local msg="$*"
-  if type register_info >/dev/null 2>&1; then
-    case "$level" in
-      INFO) register_info "$msg" ;;
-      WARN) register_warn "$msg" ;;
-      ERROR) register_error "$msg" ;;
-      DEBUG) register_debug "$msg" ;;
-      *) register_info "$msg" ;;
+  if ${REGISTER_IF_PRESENT} && type register_info >/dev/null 2>&1; then
+    case "$lvl" in
+      INFO) register_info "$msg"; return 0 ;;
+      WARN) register_warn "$msg"; return 0 ;;
+      ERROR) register_error "$msg"; return 0 ;;
+      DEBUG) register_debug "$msg"; return 0 ;;
+      *) register_info "$msg"; return 0 ;;
     esac
+  fi
+  if [[ "${DEP_SILENT}" == "true" && "$lvl" != "ERROR" ]]; then
     return 0
   fi
-  if [[ "${DEP_SILENT}" == "true" && "$level" != "ERROR" ]]; then
-    return 0
-  fi
-  case "$level" in
-    INFO)  printf '\e[32m[INFO]\e[0m %s\n' "$msg" ;;
-    WARN)  printf '\e[33m[WARN]\e[0m %s\n' "$msg" >&2 ;;
-    ERROR) printf '\e[31m[ERROR]\e[0m %s\n' "$msg" >&2 ;;
-    DEBUG) [[ "${DEP_DEBUG}" == "true" ]] && printf '\e[36m[DEBUG]\e[0m %s\n' "$msg" ;;
-    *) printf '[LOG] %s\n' "$msg" ;;
+  case "$lvl" in
+    INFO)  printf '\e[32m[DEP INFO]\e[0m %s\n' "$msg" ;;
+    WARN)  printf '\e[33m[DEP WARN]\e[0m %s\n' "$msg" >&2 ;;
+    ERROR) printf '\e[31m[DEP ERR]\e[0m %s\n' "$msg" >&2 ;;
+    DEBUG) [[ "${DEP_DEBUG}" == "true" ]] && printf '\e[36m[DEP DBG]\e[0m %s\n' "$msg" ;;
+    *) printf '[DEP] %s\n' "$msg" ;;
   esac
 }
 
-fail() {
-  _dep_log ERROR "$*"
-  exit 1
+_dfail() {
+  local msg="$1"; local code="${2:-1}"
+  _dlog ERROR "$msg"
+  _db_unlock || true
+  exit "$code"
 }
 
-# ----------------------------
-# File/dir initialization
-# ----------------------------
-_dep_init_dirs() {
-  mkdir -p "${DEP_BASE}" "${DEP_BACKUP_DIR}" "${DEP_LOG_DIR}" "$(dirname "${DEP_LOCK}")"
-  chmod 750 "${DEP_BASE}" || true
-  touch "${DEP_DB}" "${DEP_INSTALLED}" 2>/dev/null || true
-  chmod 640 "${DEP_DB}" "${DEP_INSTALLED}" 2>/dev/null || true
-}
-
-# ----------------------------
-# Lock helpers (global)
-# ----------------------------
-_dep_lock_acquire() {
-  _dep_init_dirs
-  exec {DEP_FD}>"${DEP_LOCK}" || { _dep_log WARN "Não pode abrir lockfile ${DEP_LOCK}"; return 2; }
-  # try non-blocking first, then blocking with timeout
-  if flock -n "${DEP_FD}"; then
-    _dep_log DEBUG "Lock adquirido imediatamente"
+# -------------------------
+# DB lock helpers
+# -------------------------
+_db_lock() {
+  local lockfile="${DB_LOCK_DIR}/packages.db.lock"
+  mkdir -p "${DB_LOCK_DIR}" 2>/dev/null || true
+  exec {DB_FD}>"${lockfile}" || _dfail "Não foi possível abrir lock ${lockfile}"
+  if flock -n "${DB_FD}"; then
+    _dlog DEBUG "DB lock adquirido"
     return 0
   fi
-  _dep_log INFO "Aguardando lock depende (timeout ${DEP_FLOCK_TIMEOUT}s)..."
-  # block with timeout implemented via sleep loop
+  _dlog INFO "Aguardando lock DB..."
   local waited=0
-  while ! flock -n "${DEP_FD}"; do
+  local timeout="${DB_LOCK_TIMEOUT:-300}"
+  while ! flock -n "${DB_FD}"; do
     sleep 1
     waited=$((waited+1))
-    if (( waited >= DEP_FLOCK_TIMEOUT )); then
-      _dep_log ERROR "Timeout ao aguardar lock (${DEP_FLOCK_TIMEOUT}s)"
-      return 3
+    if (( waited >= timeout )); then
+      _dfail "Timeout aguardando DB lock"
     fi
   done
-  _dep_log DEBUG "Lock adquirido após espera ${waited}s"
+  _dlog DEBUG "DB lock obtido após ${waited}s"
+}
+
+_db_unlock() {
+  if [[ -n "${DB_FD:-}" ]]; then
+    eval "exec ${DB_FD}>&-"
+    unset DB_FD
+  fi
+}
+
+# -------------------------
+# DB utilities
+# DB row format: name|version|depends|build_deps|opt_deps
+# - depends/build_deps/opt_deps are comma-separated lists (no spaces recommended)
+# -------------------------
+_db_ensure() {
+  if [[ ! -f "${DB_PATH}" ]]; then
+    mkdir -p "$(dirname "${DB_PATH}")" 2>/dev/null || true
+    printf '# packages.db - auto-created %s\n' "$(_SESSION_TS)" > "${DB_PATH}"
+    chmod 0640 "${DB_PATH}" 2>/dev/null || true
+    _dlog INFO "DB criado em ${DB_PATH}"
+  fi
+}
+
+_db_backup() {
+  mkdir -p "${DB_BACKUP_DIR}" 2>/dev/null || true
+  local bak="${DB_BACKUP_DIR}/packages.db.bak.${_SESSION_TS}"
+  cp -a "${DB_PATH}" "${bak}" 2>/dev/null || _dlog WARN "Falha ao criar backup DB"
+  # rotate retention
+  local arr; IFS=$'\n' read -r -d '' -a arr < <(ls -1t "${DB_BACKUP_DIR}"/packages.db.bak.* 2>/dev/null || true; printf '\0')
+  local cnt="${#arr[@]}"
+  if (( cnt > DB_RETENTION )); then
+    for ((i=DB_RETENTION;i<cnt;i++)); do
+      rm -f "${arr[i]}" || true
+      _dlog DEBUG "Removido old backup ${arr[i]}"
+    done
+  fi
+  _dlog DEBUG "DB backup criado: ${bak}"
+}
+
+# parse a DB line into associative array (by reference)
+# usage: _db_parse_line "line" assoc_name
+_db_parse_line() {
+  local line="$1"; local out="$2"
+  IFS='|' read -r name version depends build_deps opt_deps <<< "${line}"
+  declare -A tmp=()
+  tmp[name]="${name:-}"
+  tmp[version]="${version:-}"
+  tmp[depends]="${depends:-}"
+  tmp[build_deps]="${build_deps:-}"
+  tmp[opt_deps]="${opt_deps:-}"
+  # export to caller var name
+  eval "${out}=( )"
+  for k in "${!tmp[@]}"; do
+    local v="${tmp[$k]}"
+    v="${v//\"/\\\"}"
+    eval "${out}[\"$k\"]=\"$v\""
+  done
+}
+
+# get DB row line by pkg name (first match)
+_db_get_line() {
+  local pkg="$1"
+  _db_ensure
+  local line
+  line="$(grep -E "^${pkg}\\|" "${DB_PATH}" 2>/dev/null || true)"
+  if [[ -z "${line}" ]]; then
+    return 1
+  fi
+  printf '%s' "${line%%$'\n'*}"
   return 0
 }
 
-_dep_lock_release() {
-  if [[ -n "${DEP_FD:-}" ]]; then
-    eval "exec ${DEP_FD}>&-"
-    unset DEP_FD
-  fi
+# set/update DB entry atomically
+# usage: _db_set pkg version depends build_deps opt_deps
+_db_set() {
+  local pkg="$1"; local version="$2"; local depends="$3"; local build_deps="$4"; local opt_deps="$5"
+  _db_ensure
+  _db_backup
+  local tmp; tmp="$(mktemp "${DB_PATH}.tmp.XXXX")"
+  # write header preserved
+  grep -E '^#' "${DB_PATH}" 2>/dev/null || true > "${tmp}" || true
+  # filter out existing entry
+  grep -v -E "^${pkg}\\|" "${DB_PATH}" 2>/dev/null || true >> "${tmp}"
+  # append new entry
+  printf '%s|%s|%s|%s|%s\n' "${pkg}" "${version:-}" "${depends:-}" "${build_deps:-}" "${opt_deps:-}" >> "${tmp}"
+  mv -f "${tmp}" "${DB_PATH}" || _dfail "Falha ao gravar DB"
+  chmod 0640 "${DB_PATH}" 2>/dev/null || true
+  _dlog INFO "DB atualizado: ${pkg}|${version}|${depends}|${build_deps}|${opt_deps}"
 }
 
-# ----------------------------
-# Backup DB (transactional safety)
-# ----------------------------
-_dep_backup_db() {
-  _dep_init_dirs
-  local ts; ts=$(date -u +"%Y%m%dT%H%M%SZ")
-  cp -a "${DEP_DB}" "${DEP_BACKUP_DIR}/depends.db.${ts}" 2>/dev/null || true
-  cp -a "${DEP_INSTALLED}" "${DEP_BACKUP_DIR}/installed.db.${ts}" 2>/dev/null || true
-  _dep_log DEBUG "Backup do DB criado em ${DEP_BACKUP_DIR} (ts=${ts})"
-}
-
-# ----------------------------
-# Load DB into memory (associative arrays)
-# ----------------------------
-dep_load() {
-  if [[ "${_DEP_LOADED}" == "true" ]]; then
-    _dep_log DEBUG "dep_load: já carregado"
-    return 0
-  fi
-  _dep_init_dirs
-  # initialize arrays
-  _DEP_GRAPH=()
-  _DEP_REVGRAPH=()
-  _INSTALLED_VER=()
-
-  # load depends.db
-  if [[ -f "${DEP_DB}" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      line=${line%%#*}   # strip comments
-      [[ -z "${line// /}" ]] && continue
-      # format: pkg:dep1 dep2 ...
-      if [[ "$line" =~ ^([^:]+):[[:space:]]*(.*)$ ]]; then
-        local pkg="${BASH_REMATCH[1]}"
-        local deps="${BASH_REMATCH[2]}"
-        # normalize whitespace
-        deps=$(echo "${deps}" | xargs)
-        _DEP_GRAPH["$pkg"]="$deps"
-        # populate reverse graph
-        for d in $deps; do
-          local cur="${_DEP_REVGRAPH[$d]:-}"
-          if [[ -z "$cur" ]]; then
-            _DEP_REVGRAPH[$d]="$pkg"
-          else
-            _DEP_REVGRAPH[$d]="${cur} ${pkg}"
-          fi
-        done
-      fi
-    done < "${DEP_DB}"
-  fi
-
-  # load installed.db
-  if [[ -f "${DEP_INSTALLED}" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      line=${line%%#*}
-      [[ -z "${line// /}" ]] && continue
-      if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
-        local pkg="${BASH_REMATCH[1]}"
-        local ver="${BASH_REMATCH[2]}"
-        _INSTALLED_VER["$pkg"]="$ver"
-      fi
-    done < "${DEP_INSTALLED}"
-  fi
-
-  _DEP_LOADED=true
-  _dep_log INFO "dep_load: banco carregado (pkgs=${#_DEP_GRAPH[@]})"
-}
-
-# ----------------------------
-# Persist DB back to disk (atomic)
-# ----------------------------
-dep_save() {
-  _dep_lock_acquire || fail "Não foi possível adquirir lock para salvar DB"
-  _dep_backup_db
-  local tmpdb; tmpdb=$(mktemp "${DEP_BASE}/depends.db.tmp.XXXX") || { _dep_lock_release; fail "mktemp failed"; }
-  local tmpinst; tmpinst=$(mktemp "${DEP_BASE}/installed.db.tmp.XXXX") || { rm -f "$tmpdb"; _dep_lock_release; fail "mktemp failed"; }
-  # write depends
-  for pkg in "${!_DEP_GRAPH[@]}"; do
-    echo "${pkg}: ${_DEP_GRAPH[$pkg]}" >> "$tmpdb"
-  done
-  chmod 640 "$tmpdb" || true
-  mv -f "$tmpdb" "${DEP_DB}"
-  # write installed
-  for pkg in "${!_INSTALLED_VER[@]}"; do
-    echo "${pkg}=${_INSTALLED_VER[$pkg]}" >> "$tmpinst"
-  done
-  chmod 640 "$tmpinst" || true
-  mv -f "$tmpinst" "${DEP_INSTALLED}"
-  _dep_log INFO "dep_save: DB persistido"
-  _dep_lock_release
-}
-
-# ----------------------------
-# Helpers: read deps from metafile if present
-# ----------------------------
-# Expects argument: path to metafile.ini
-# Returns: prints space-separated dependencies
-dep_read_from_metafile() {
-  local mf="$1"
-  [[ -f "$mf" ]] || { _dep_log DEBUG "metafile não encontrado: $mf"; return 0; }
-  # crude but effective parser for key 'depends' or 'depends_on' or 'requires'
-  local deps=""
-  while IFS='=' read -r k v || [[ -n "$k" ]]; do
-    k=${k// /}
-    case "${k}" in
-      depends|dependencies|requires)
-        deps="$v"
-        break
-        ;;
-      *) ;;
-    esac
-  done < "$mf"
-  deps=$(echo "$deps" | xargs)
-  printf '%s' "$deps"
-}
-
-# ----------------------------
-# Manipular banco em memória
-# ----------------------------
-dep_add() {
-  # dep_add <pkg> "<dep1 dep2 ...>"
-  local pkg="$1"; shift
-  local deps="$*"
-  dep_load
-  deps=$(echo "$deps" | xargs)
-  _DEP_GRAPH["$pkg"]="$deps"
-  # rebuild reverse graph entries for provided deps
-  for d in $deps; do
-    local cur="${_DEP_REVGRAPH[$d]:-}"
-    if [[ -z "$cur" ]]; then
-      _DEP_REVGRAPH[$d]="$pkg"
-    else
-      # avoid duplicates
-      case " $cur " in
-        *" $pkg "*) : ;;
-        *) _DEP_REVGRAPH[$d]="${cur} ${pkg}" ;;
-      esac
-    fi
-  done
-  _dep_log INFO "dep_add: $pkg -> $deps"
-  dep_save
-}
-
-dep_remove() {
-  # dep_remove <pkg>
+# remove DB entry
+_db_remove() {
   local pkg="$1"
-  dep_load
-  if [[ -z "${_DEP_GRAPH[$pkg]:-}" && -z "${_INSTALLED_VER[$pkg]:-}" ]]; then
-    _dep_log WARN "dep_remove: pacote desconhecido: $pkg"
-  fi
-  unset _DEP_GRAPH["$pkg"]
-  unset _INSTALLED_VER["$pkg"]
-  # rebuild reverse graph fresh
-  _DEP_REVGRAPH=()
-  for p in "${!_DEP_GRAPH[@]}"; do
-    for d in ${_DEP_GRAPH[$p]}; do
-      local c="${_DEP_REVGRAPH[$d]:-}"
-      _DEP_REVGRAPH[$d]="${c} ${p}"
-    done
-  done
-  _dep_log INFO "dep_remove: $pkg removido do DB"
-  dep_save
+  _db_ensure
+  _db_backup
+  local tmp; tmp="$(mktemp "${DB_PATH}.tmp.XXXX")"
+  grep -E '^#' "${DB_PATH}" 2>/dev/null || true > "${tmp}" || true
+  grep -v -E "^${pkg}\\|" "${DB_PATH}" 2>/dev/null || true >> "${tmp}"
+  mv -f "${tmp}" "${DB_PATH}" || _dfail "Falha ao remover do DB"
+  _dlog INFO "DB remove: ${pkg}"
 }
 
-# ----------------------------
-# Query helpers
-# ----------------------------
-dep_check_installed() {
+# list all installed packages (names)
+_db_list_pkgs() {
+  _db_ensure
+  awk -F'|' '$0 !~ /^#/ && NF>=1 { print $1 }' "${DB_PATH}" 2>/dev/null || true
+}
+
+# check if pkg installed
+_db_is_installed() {
   local pkg="$1"
-  dep_load
-  if [[ -n "${_INSTALLED_VER[$pkg]:-}" ]]; then
-    printf '%s' "${_INSTALLED_VER[$pkg]}"
+  if _db_get_line "$pkg" >/dev/null 2>&1; then
     return 0
   fi
   return 1
 }
 
-dep_list_direct() {
-  local pkg="$1"
-  dep_load
-  echo "${_DEP_GRAPH[$pkg]:-}" | xargs
+# get fields from DB entry into associative array by name
+_db_get_assoc() {
+  local pkg="$1"; local out="$2"
+  local line
+  line="$(_db_get_line "$pkg" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then return 1; fi
+  _db_parse_line "$line" "$out"
+  return 0
+}
+# Part 2 continuation of depende.sh
+
+# -------------------------
+# Helpers: split/join lists (comma separated)
+# -------------------------
+_split_commas() {
+  local s="$1"
+  if [[ -z "$s" ]]; then
+    echo ""
+    return 0
+  fi
+  # replace commas with newlines, trim spaces
+  printf '%s' "$s" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' || true
 }
 
-dep_list_reverse() {
-  local pkg="$1"
-  dep_load
-  echo "${_DEP_REVGRAPH[$pkg]:-}" | xargs
+_join_commas() {
+  local arr=("$@")
+  local out=""
+  for e in "${arr[@]}"; do
+    if [[ -z "$out" ]]; then out="${e}"; else out="${out},${e}"; fi
+  done
+  printf '%s' "$out"
 }
 
-# ----------------------------
-# Topological sort (DFS)
-# ----------------------------
-# returns ordered list (space-separated) of packages to build/install so that deps come first
-# dep_resolve <pkg> [--include-root]
-dep_resolve() {
+# -------------------------
+# Virtual mapping (optional)
+# Format file (simple):
+# virtual_name=real1,real2,real3
+# -------------------------
+_virtual_resolve() {
+  local name="$1"
+  if [[ -z "${DEP_VIRTUAL_MAP}" ]]; then
+    return 1
+  fi
+  if [[ ! -f "${DEP_VIRTUAL_MAP}" ]]; then
+    _dlog WARN "VIRTUAL_MAP configured but file not found: ${DEP_VIRTUAL_MAP}"
+    return 1
+  fi
+  local line
+  line="$(grep -E "^${name}=" "${DEP_VIRTUAL_MAP}" 2>/dev/null || true)"
+  if [[ -z "$line" ]]; then return 1; fi
+  local val="${line#*=}"
+  # output comma list
+  printf '%s' "$val"
+  return 0
+}
+
+# -------------------------
+# Resolve dependencies recursively for a package (reads metafile via meta_load)
+# Returns ordered list (topological) in stdout, or non-zero on cycle/missing
+# Approach:
+#  - build adjacency via dfs
+#  - detect cycles
+#  - produce reverse postorder (dependency first)
+# -------------------------
+_resolve_recursive() {
   local root="$1"
-  local include_root="${2:-true}"
+  local seen_file; seen_file="$(mktemp)"
+  local visiting_file; visiting_file="$(mktemp)"
+  declare -A ADJ=()
+  declare -A ALL_PKGS=()
 
-  dep_load
-
-  # We'll build a DAG by reading from memory; if a package not in DB, attempt to read metafile
-  # Search strategy for metafile:
-  #  - /usr/src/<category>/<pkg>/<pkg>.ini
-  #  - /mnt/lfs/usr/src/<category>/<pkg>/<pkg>.ini
-  # If not found, assume no declared deps.
-
-  local -A visited=()
-  local -A onstack=()
-  local -a order=()
-  local cycle_detected=0
-
-  # helper function DFS
-  _dfs() {
-    local node="$1"
-    # recursion guard
-    if (( ${#visited[@]} > DEP_MAX_RECURSION )); then
-      fail "dep_resolve: recursion limit exceeded"
+  # read metafile: try to locate via meta_find if available, else expect just name if installed
+  _load_meta_info() {
+    local pkg="$1"
+    local name version depends build_deps opt_deps
+    # Try using meta_load if available
+    if type meta_find >/dev/null 2>&1 && type meta_load >/dev/null 2>&1; then
+      local mf
+      mf="$(meta_find "$pkg" 2>/dev/null || true)"
+      if [[ -n "$mf" ]]; then
+        meta_load "$mf" TMP_META || true
+        name="${META_NAME:-$pkg}"
+        version="${META_VERSION:-}"
+        depends="${META_DEPENDS:-}"
+        build_deps="${META_BUILD_DEPS:-}"
+        opt_deps="${META_OPT_DEPS:-}"
+      else
+        # fallback: if installed, read from DB
+        if _db_is_installed "$pkg"; then
+          declare -A row=()
+          _db_get_assoc "$pkg" row || true
+          name="${row[name]:-$pkg}"
+          version="${row[version]:-}"
+          depends="${row[depends]:-}"
+          build_deps="${row[build_deps]:-}"
+          opt_deps="${row[opt_deps]:-}"
+        else
+          name="$pkg"; version=""; depends=""; build_deps=""; opt_deps=""
+        fi
+      fi
+    else
+      # no metafile helpers: try DB
+      if _db_is_installed "$pkg"; then
+        declare -A row=()
+        _db_get_assoc "$pkg" row || true
+        name="${row[name]:-$pkg}"
+        version="${row[version]:-}"
+        depends="${row[depends]:-}"
+        build_deps="${row[build_deps]:-}"
+        opt_deps="${row[opt_deps]:-}"
+      else
+        name="$pkg"; version=""; depends=""; build_deps=""; opt_deps=""
+      fi
     fi
-    if [[ "${visited[$node]:-}" == "1" ]]; then
+    # expand virtual if needed
+    if [[ -n "$depends" ]]; then
+      printf '%s\n' "DEPENDS::$pkg::$depends"
+    fi
+    if [[ -n "$build_deps" ]]; then
+      printf '%s\n' "BUILD::$pkg::$build_deps"
+    fi
+    if [[ -n "$opt_deps" ]]; then
+      printf '%s\n' "OPT::$pkg::$opt_deps"
+    fi
+  }
+
+  # dfs to build adjacency
+  declare -A visited=()
+  declare -A instack=()
+  declare -a topo=()
+  _dfs() {
+    local pkg="$1"
+    if [[ "${visited[$pkg]:-}" == "1" ]]; then
       return 0
     fi
-    if [[ "${onstack[$node]:-}" == "1" ]]; then
-      _dep_log ERROR "Ciclo detectado envolvendo: $node"
-      cycle_detected=1
-      return 1
+    if [[ "${instack[$pkg]:-}" == "1" ]]; then
+      _dlog ERROR "Ciclo detectado envolvendo ${pkg}"
+      return 2
     fi
-    onstack[$node]=1
+    instack[$pkg]=1
+    # load pkg deps
+    local depline
+    # Try to get metafile; if not exists and DEP_FAIL_ON_MISSING true => abort
+    local mf
+    mf="$(type meta_find >/dev/null 2>&1 && meta_find "$pkg" 2>/dev/null || true)"
+    if [[ -z "$mf" && "${DEP_FAIL_ON_MISSING}" == "true" && ! _db_is_installed "$pkg" ]]; then
+      _dlog ERROR "Metafile não encontrado para ${pkg} e DEP_FAIL_ON_MISSING=true"
+      return 3
+    fi
+    # obtain lists
+    local depends_list=""
+    local build_list=""
+    if [[ -n "$mf" ]]; then
+      meta_load "$mf" TMP_META || true
+      depends_list="${META_DEPENDS:-}"
+      build_list="${META_BUILD_DEPS:-}"
+      # note: opt_deps are not automatically recursed unless flagged
+    else
+      # try DB
+      if _db_is_installed "$pkg"; then
+        declare -A row=(); _db_get_assoc "$pkg" row || true
+        depends_list="${row[depends]:-}"
+        build_list="${row[build_deps]:-}"
+      fi
+    fi
 
-    # get direct deps: try DB, else attempt to read metafile path(s)
-    local deps="${_DEP_GRAPH[$node]:-}"
-    if [[ -z "$deps" ]]; then
-      # try to find metafile by guessing category from installed DB or file system
-      # This is heuristic; if not found, treat as leaf
-      # Try /usr/src/*/<node>/*.ini and /mnt/lfs/usr/src/*/<node>/*.ini
-      for base in "${SRC_DIR:-/usr/src}" "${LFS_SRC_DIR:-/mnt/lfs/usr/src}"; do
-        if [[ -d "$base" ]]; then
-          local mf
-          mf=$(find "$base" -type f -name "${node}.ini" -print -quit 2>/dev/null || true)
-          if [[ -n "$mf" ]]; then
-            deps=$(dep_read_from_metafile "$mf")
-            _dep_log DEBUG "dep_resolve: lido deps de metafile $mf => $deps"
-            break
+    # expand comma lists and virtuals
+    local dep_item
+    local rawdeps dep_resolved
+    rawdeps="$(printf '%s\n' "${depends_list}" | sed 's/,/ /g')"
+    for dep_item in ${rawdeps}; do
+      dep_item="$(echo -n "$dep_item" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+      [[ -z "$dep_item" ]] && continue
+      # if virtual map contains entry, expand
+      if _virtual_resolve "$dep_item" >/dev/null 2>&1; then
+        dep_resolved="$(_virtual_resolve "$dep_item")"
+        # expand those
+        for dd in $(echo "$dep_resolved" | tr ',' ' '); do
+          _dfs "$dd" || return $?
+        done
+      else
+        _dfs "$dep_item" || return $?
+      fi
+    done
+
+    # also include build_deps as they may be needed before compile
+    rawdeps="$(printf '%s\n' "${build_list}" | sed 's/,/ /g')"
+    for dep_item in ${rawdeps}; do
+      dep_item="$(echo -n "$dep_item" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+      [[ -z "$dep_item" ]] && continue
+      if _virtual_resolve "$dep_item" >/dev/null 2>&1; then
+        dep_resolved="$(_virtual_resolve "$dep_item")"
+        for dd in $(echo "$dep_resolved" | tr ',' ' '); do
+          _dfs "$dd" || return $?
+        done
+      else
+        _dfs "$dep_item" || return $?
+      fi
+    done
+
+    visited[$pkg]=1
+    instack[$pkg]=0
+    topo+=("$pkg")
+    return 0
+  }
+
+  # start dfs at root
+  instack=()
+  visited=()
+  topo=()
+  _dfs "$root" || return $?
+
+  # topo array now contains reverse-postorder (dependency-first?), reverse it to get install order: dependencies first
+  # currently topo has order: children before parent (we appended after recursion), so it's correct: first elements are deepest deps.
+  # print unique in order
+  declare -A seen=()
+  for p in "${topo[@]}"; do
+    if [[ -z "${seen[$p]:-}" ]]; then
+      printf '%s\n' "$p"
+      seen[$p]=1
+    fi
+  done
+
+  rm -f "$seen_file" "$visiting_file" 2>/dev/null || true
+  return 0
+}
+
+# -------------------------
+# Top-level resolve wrapper: expands opt_deps only if flag set
+# returns newline separated ordered list
+# -------------------------
+resolve_deps() {
+  local pkg="$1"; shift
+  local include_opt="${1:-false}"
+  _dlog DEBUG "resolve_deps: resolving ${pkg} include_opt=${include_opt}"
+  _resolve_recursive "$pkg" || return $?
+  # if include_opt true, we should add opt_deps from metafile at end (not required)
+  if [[ "${include_opt}" == "true" ]]; then
+    # load opt_deps and append if not present
+    if type meta_find >/dev/null 2>&1 && type meta_load >/dev/null 2>&1; then
+      local mf
+      mf="$(meta_find "$pkg" 2>/dev/null || true)"
+      if [[ -n "$mf" ]]; then
+        meta_load "$mf" TMP_META || true
+        local opt="${META_OPT_DEPS:-}"
+        for o in $(_split_commas "$opt"); do
+          # print if not already in list (simple approach: append)
+          printf '%s\n' "$o"
+        done
+      fi
+    fi
+  fi
+}
+
+# -------------------------
+# Check dependencies installed: returns 0 if all installed, else non-zero and prints missing list
+# -------------------------
+dep_check_installed() {
+  local pkg="$1"
+  local include_opt="${2:-false}"
+  local missing=()
+  local dep
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if ! _db_is_installed "$dep"; then
+      missing+=("$dep")
+    fi
+  done < <(resolve_deps "$pkg" "${include_opt}" || true)
+
+  if (( ${#missing[@]} == 0 )); then
+    _dlog INFO "dep_check_installed: todas as dependências satisfeitas para ${pkg}"
+    return 0
+  else
+    _dlog WARN "dep_check_installed: dependências faltantes para ${pkg}: ${missing[*]}"
+    printf '%s\n' "${missing[@]}"
+    return 2
+  fi
+}
+
+# -------------------------
+# Install missing dependencies by building them (calls build.sh)
+# Behavior:
+#  - resolves ordered list
+#  - for each dep not installed, call build.sh --metafile <metafile> (or build.sh <pkg>)
+#  - stop on first failure and report
+# -------------------------
+dep_install_missing() {
+  local pkg="$1"
+  local include_opt="${2:-false}"
+  local deps_to_install=()
+  local dep
+
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
+    if ! _db_is_installed "$dep"; then
+      deps_to_install+=("$dep")
+    fi
+  done < <(resolve_deps "$pkg" "${include_opt}" || true)
+
+  if (( ${#deps_to_install[@]} == 0 )); then
+    _dlog INFO "dep_install_missing: nada a instalar para ${pkg}"
+    return 0
+  fi
+
+  _dlog INFO "dep_install_missing: instalar na ordem: ${deps_to_install[*]}"
+
+  for d in "${deps_to_install[@]}"; do
+    _dlog INFO "Construindo dependência: ${d}"
+    # Find metafile for d
+    local mf
+    if type meta_find >/dev/null 2>&1; then
+      mf="$(meta_find "$d" 2>/dev/null || true)"
+    fi
+    if [[ -z "${mf}" ]]; then
+      _dlog WARN "metafile não encontrado para ${d}; tentando construir via build.sh com nome"
+      if [[ -x "${BUILD_CMD}" ]]; then
+        if "${BUILD_CMD}" --name "${d}" >> "${DEP_CACHE_DIR}/${d}.build.log" 2>&1; then
+          _dlog INFO "build.sh succeeded for ${d}"
+          # After successful build, try to register in DB if build.sh created meta or outputs
+          # Attempt to detect version by reading metafile if created
+          local version=""
+          if [[ -n "${mf}" ]]; then
+            meta_load "$mf" TMP_META || true
+            version="${META_VERSION:-}"
           fi
-        fi
-      done
-    fi
-
-    for d in $deps; do
-      if [[ -z "$d" ]]; then continue; fi
-      _dfs "$d" || return 1
-    done
-
-    visited[$node]=1
-    onstack[$node]=0
-    order+=("$node")
-    return 0
-  }
-
-  # start DFS
-  _dfs "$root" || {
-    if (( cycle_detected == 1 )); then
-      fail "dep_resolve: ciclo detectado; abortando resolução para $root"
-    else
-      fail "dep_resolve: falha ao resolver $root"
-    fi
-  }
-
-  # order now has root last; reverse to get deps first
-  local seq=""
-  for ((i=${#order[@]}-1; i>=0; i--)); do
-    if [[ "$include_root" == "true" ]]; then
-      seq="${seq} ${order[i]}"
-    else
-      if [[ "${order[i]}" != "$root" ]]; then
-        seq="${seq} ${order[i]}"
-      fi
-    fi
-  done
-  echo "${seq}" | xargs
-}
-
-# ----------------------------
-# Topological sort for multiple roots (returns unique ordered list)
-# dep_resolve_many pkg1 pkg2 ...
-dep_resolve_many() {
-  local roots=("$@")
-  local combined=""
-  for r in "${roots[@]}"; do
-    local part
-    part=$(dep_resolve "$r" "true") || fail "dep_resolve_many: erro resolvendo $r"
-    combined="${combined} ${part}"
-  done
-  # uniq while preserving order
-  local -a seen=()
-  local -A mark=()
-  for p in $combined; do
-    if [[ -z "${mark[$p]:-}" ]]; then
-      seen+=("$p")
-      mark[$p]=1
-    fi
-  done
-  echo "${seen[@]}"
-}
-
-# ----------------------------
-# Orphans detection (installed packages without reverse deps)
-# ----------------------------
-dep_orphans() {
-  dep_load
-  local orphans=()
-  for pkg in "${!_INSTALLED_VER[@]}"; do
-    local rev; rev=$(dep_list_reverse "$pkg" || true)
-    # rev may list packages not installed; filter by installed
-    local has_installed_rev=false
-    for r in $rev; do
-      if [[ -n "${_INSTALLED_VER[$r]:-}" ]]; then has_installed_rev=true; break; fi
-    done
-    if [[ "$has_installed_rev" == "false" ]]; then
-      orphans+=("$pkg")
-    fi
-  done
-  echo "${orphans[@]}" | xargs
-}
-
-# ----------------------------
-# Remove orphans safely (calls uninstall.sh or remove entry)
-# dep_clean_orphans [--auto|--dry-run]
-dep_clean_orphans() {
-  local mode="${1:-dry-run}"
-  dep_load
-  local orphans; orphans=$(dep_orphans)
-  if [[ -z "$orphans" ]]; then
-    _dep_log INFO "dep_clean_orphans: nenhum órfão encontrado"
-    return 0
-  fi
-  _dep_log INFO "dep_clean_orphans: órfãos detectados: $orphans"
-  for p in $orphans; do
-    if [[ "$mode" == "dry-run" ]]; then
-      echo "$p"
-    else
-      # try to call uninstall.sh if available
-      if type uninstall >/dev/null 2>&1 || command -v uninstall.sh >/dev/null 2>&1; then
-        _dep_log INFO "Removendo $p via uninstall.sh"
-        if type uninstall >/dev/null 2>&1; then
-          uninstall "$p" || _dep_log WARN "uninstall $p retornou erro"
+          _db_set "${d}" "${version}" "" "" "" || true
         else
-          uninstall.sh --name "$p" || _dep_log WARN "uninstall.sh --name $p retornou erro"
+          _dlog ERROR "Falha ao construir ${d}; ver log ${DEP_CACHE_DIR}/${d}.build.log"
+          return 3
         fi
       else
-        _dep_log INFO "Removendo entradas DB para $p (uninstall tool ausente)"
-        dep_remove "$p"
-      fi
-    fi
-  done
-}
-
-# ----------------------------
-# Auto-install dependencies via install.sh
-# dep_auto_install <pkg>
-# returns non-zero on error
-dep_auto_install() {
-  local pkg="$1"
-  dep_load
-  local seq
-  seq=$(dep_resolve "$pkg" "true" ) || fail "dep_auto_install: não pôde resolver $pkg"
-  _dep_log INFO "dep_auto_install: ordem resolvida: $seq"
-  for p in $seq; do
-    # skip if already installed
-    if dep_check_installed "$p" >/dev/null 2>&1; then
-      _dep_log DEBUG "dep_auto_install: $p já instalado; pulando"
-      continue
-    fi
-    _dep_log INFO "dep_auto_install: instalando $p"
-    # try to call install.sh --build or metafile approach
-    if type install >/dev/null 2>&1; then
-      install "$p" || { _dep_log ERROR "install $p falhou"; return 1; }
-    elif command -v "${DEP_AUTO_INSTALL_CMD}" >/dev/null 2>&1; then
-      ${DEP_AUTO_INSTALL_CMD} --name "$p" || { _dep_log ERROR "${DEP_AUTO_INSTALL_CMD} falhou para $p"; return 1; }
-    elif type mf_load >/dev/null 2>&1; then
-      # if metafile present try to find metafile and call mf_build
-      # heuristics: search /usr/src/*/<p>/<p>.ini
-      local mf
-      mf=$(find /usr/src -type f -name "${p}.ini" -print -quit 2>/dev/null || true)
-      if [[ -n "$mf" ]]; then
-        mf_load "$mf"
-        mf_fetch_sources || { _dep_log ERROR "fetch failed for $p"; return 1; }
-        mf_apply_patches || true
-        mf_construction || { _dep_log ERROR "build failed for $p"; return 1; }
-      else
-        _dep_log ERROR "dep_auto_install: não encontrou forma de instalar $p"
-        return 1
+        _dlog ERROR "BUILD_CMD não encontrado (${BUILD_CMD}); não é possível construir ${d}"
+        return 4
       fi
     else
-      _dep_log ERROR "dep_auto_install: Nenhuma ferramenta de instalação disponível for $p"
-      return 1
-    fi
-    # on success, mark installed with unknown version if not set (update installed db)
-    if [[ -z "${_INSTALLED_VER[$p]:-}" ]]; then
-      _INSTALLED_VER[$p]="<unknown>"
-      dep_save || true
+      # call build.sh with --metafile <mf>
+      if [[ -x "${BUILD_CMD}" ]]; then
+        _dlog DEBUG "Invocando build.sh --metafile ${mf} para ${d}"
+        if "${BUILD_CMD}" --metafile "${mf}" >> "${DEP_CACHE_DIR}/${d}.build.log" 2>&1; then
+          _dlog INFO "Build concluído para ${d}"
+          # try to load version from metafile and register in DB
+          meta_load "$mf" TMP_META || true
+          local ver="${META_VERSION:-}"
+          local deps="${META_DEPENDS:-}"
+          local bdeps="${META_BUILD_DEPS:-}"
+          local opdeps="${META_OPT_DEPS:-}"
+          _db_set "${d}" "${ver}" "${deps}" "${bdeps}" "${opdeps}"
+        else
+          _dlog ERROR "Build falhou para ${d}; ver ${DEP_CACHE_DIR}/${d}.build.log"
+          return 5
+        fi
+      else
+        _dlog ERROR "BUILD_CMD não executável: ${BUILD_CMD}"
+        return 6
+      fi
     fi
   done
+
+  _dlog INFO "dep_install_missing: dependências instaladas para ${pkg}"
   return 0
 }
 
-# ----------------------------
-# Auto-build dependencies via build.sh (similar to auto_install)
-# dep_auto_build <pkg>
-dep_auto_build() {
-  local pkg="$1"
-  dep_load
-  local seq
-  seq=$(dep_resolve "$pkg" "true") || fail "dep_auto_build: não pôde resolver $pkg"
-  _dep_log INFO "dep_auto_build: ordem: $seq"
-  for p in $seq; do
-    # if installed skip
-    if dep_check_installed "$p" >/dev/null 2>&1; then
-      _dep_log DEBUG "dep_auto_build: $p já instalado; pulando build"
-      continue
-    fi
-    _dep_log INFO "dep_auto_build: construindo $p"
-    if type build >/dev/null 2>&1; then
-      build "$p" || { _dep_log ERROR "build $p falhou"; return 1; }
-    elif command -v "${DEP_AUTO_BUILD_CMD}" >/dev/null 2>&1; then
-      ${DEP_AUTO_BUILD_CMD} --name "$p" || { _dep_log ERROR "${DEP_AUTO_BUILD_CMD} falhou para $p"; return 1; }
-    elif type mf_load >/dev/null 2>&1; then
-      local mf
-      mf=$(find /usr/src -type f -name "${p}.ini" -print -quit 2>/dev/null || true)
-      if [[ -n "$mf" ]]; then
-        mf_load "$mf"
-        mf_fetch_sources || { _dep_log ERROR "fetch failed for $p"; return 1; }
-        mf_apply_patches || true
-        mf_construction || { _dep_log ERROR "build failed for $p"; return 1; }
-      else
-        _dep_log ERROR "dep_auto_build: não encontrou forma de buildar $p"
-        return 1
-      fi
-    else
-      _dep_log ERROR "dep_auto_build: Nenhuma ferramenta de build disponível para $p"
-      return 1
-    fi
-    # mark installed
-    if [[ -z "${_INSTALLED_VER[$p]:-}" ]]; then
-      _INSTALLED_VER[$p]="<unknown>"
-      dep_save || true
+# -------------------------
+# List orphan packages (installed but not required by any other installed package)
+# -------------------------
+dep_list_orphans() {
+  _db_ensure
+  local all; IFS=$'\n' read -r -d '' -a all < <(_db_list_pkgs && printf '\0')
+  declare -A required=()
+  # iterate DB lines and collect depends/build_deps
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    IFS='|' read -r name version depends build_deps opt_deps <<< "$line"
+    for dep in $(_split_commas "${depends:-}"); do required["$dep"]=1; done
+    for dep in $(_split_commas "${build_deps:-}"); do required["$dep"]=1; done
+    for dep in $(_split_commas "${opt_deps:-}"); do required["$dep"]=1; done
+  done < "${DB_PATH}"
+
+  local orphans=()
+  for p in "${all[@]}"; do
+    [[ -z "$p" ]] && continue
+    if [[ -z "${required[$p]:-}" ]]; then
+      orphans+=("$p")
     fi
   done
-  return 0
-}
 
-# ----------------------------
-# Reverse-dependency check (who depends on pkg)
-# dep_reverse <pkg>
-dep_reverse() {
-  local pkg="$1"
-  dep_load
-  dep_list_reverse "$pkg"
-}
-
-# ----------------------------
-# Update all: rebuild system respecting dependencies
-# dep_update_all [--dry-run]
-# Strategy: take all installed packages, compute topo order via resolving each installed root,
-# deduplicate and run rebuild in order (deps first). This enables update.sh integration.
-dep_update_all() {
-  local mode="${1:-run}"
-  dep_load
-  # gather installed packages as roots
-  local roots=()
-  for p in "${!_INSTALLED_VER[@]}"; do
-    roots+=("$p")
-  done
-  if [[ ${#roots[@]} -eq 0 ]]; then
-    _dep_log INFO "dep_update_all: nenhum pacote instalado"
+  if (( ${#orphans[@]} == 0 )); then
+    _dlog INFO "dep_list_orphans: nenhum órfão"
+    return 0
+  else
+    printf '%s\n' "${orphans[@]}"
     return 0
   fi
-  local ordered
-  ordered=$(dep_resolve_many "${roots[@]}") || fail "dep_update_all: falha ao resolver grafo"
-  _dep_log INFO "dep_update_all: ordem final: $ordered"
-  if [[ "$mode" == "dry-run" ]]; then
-    echo "$ordered"
-    return 0
-  fi
-  for p in $ordered; do
-    _dep_log INFO "dep_update_all: rebuild $p"
-    # rebuild each package; prefer build.sh or build function; fallback to metafile
-    if type build >/dev/null 2>&1; then
-      build "$p" || { _dep_log ERROR "build $p falhou"; return 1; }
-    elif command -v "${DEP_AUTO_BUILD_CMD}" >/dev/null 2>&1; then
-      ${DEP_AUTO_BUILD_CMD} --name "$p" || { _dep_log ERROR "${DEP_AUTO_BUILD_CMD} falhou para $p"; return 1; }
-    elif type mf_load >/dev/null 2>&1; then
-      local mf
-      mf=$(find /usr/src -type f -name "${p}.ini" -print -quit 2>/dev/null || true)
-      if [[ -n "$mf" ]]; then
-        mf_load "$mf"
-        mf_fetch_sources || { _dep_log ERROR "fetch failed for $p"; return 1; }
-        mf_apply_patches || true
-        mf_construction || { _dep_log ERROR "build failed for $p"; return 1; }
-      else
-        _dep_log WARN "dep_update_all: não encontrou metafile para $p; pulando"
+}
+
+# -------------------------
+# Rebuild all packages in dependency order (topological)
+# Strategy:
+#  - build order: resolve for each installed package and collect union, then sort unique preserving dependency order
+#  - invoke build.sh for each package (skip if build.sh opts say skip)
+# -------------------------
+dep_rebuild_all() {
+  _dlog INFO "dep_rebuild_all: iniciando rebuild-all"
+  # collect order by resolving each installed package
+  declare -A order_index=()
+  declare -a final_order=()
+  local idx=0
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    while IFS= read -r d; do
+      if [[ -z "${order_index[$d]:-}" ]]; then
+        order_index[$d]=$((idx++))
+        final_order+=("$d")
       fi
+    done < <(resolve_deps "$pkg" "false" || true)
+  done < <(_db_list_pkgs)
+
+  _dlog INFO "dep_rebuild_all: ordem calculada: ${final_order[*]}"
+
+  for p in "${final_order[@]}"; do
+    _dlog INFO "Reconstruindo ${p}"
+    # find metafile if exists
+    local mf=""
+    if type meta_find >/dev/null 2>&1; then
+      mf="$(meta_find "$p" 2>/dev/null || true)"
+    fi
+    if [[ -n "${mf}" && -x "${BUILD_CMD}" ]]; then
+      if ! "${BUILD_CMD}" --metafile "${mf}" >> "${DEP_CACHE_DIR}/${p}.rebuild.log" 2>&1; then
+        _dlog ERROR "Falha reconstruir ${p}; ver ${DEP_CACHE_DIR}/${p}.rebuild.log"
+        return 2
+      fi
+      _dlog INFO "Reconstrução concluída: ${p}"
     else
-      _dep_log WARN "dep_update_all: nenhuma ferramenta para rebuild $p; pulando"
+      _dlog WARN "pular ${p}: metafile/build.sh não disponível"
     fi
   done
+
+  _dlog INFO "dep_rebuild_all: finalizado"
   return 0
 }
 
-# ----------------------------
-# Utility: add installed package entry
-# dep_mark_installed <pkg> [version]
-dep_mark_installed() {
-  local pkg="$1"; local version="${2:-<unknown>}"
-  dep_load
-  _INSTALLED_VER["$pkg"]="$version"
-  dep_save
-  _dep_log INFO "dep_mark_installed: $pkg=$version"
+# -------------------------
+# Export dependency graph for a package (DOT or JSON)
+# -------------------------
+dep_graph_export() {
+  local pkg="$1"; local fmt="${2:-dot}"; local out="${3:-${GRAPH_DIR}/${pkg}-graph.${fmt}}"
+  mkdir -p "${GRAPH_DIR}" 2>/dev/null || true
+  declare -A edges=()
+  # produce edges by reading each package's depends from metafile or DB
+  _add_edges_for() {
+    local p="$1"
+    local mf
+    mf="$(type meta_find >/dev/null 2>&1 && meta_find "$p" 2>/dev/null || true)"
+    local deps=""
+    if [[ -n "$mf" ]]; then
+      meta_load "$mf" TMP_META || true
+      deps="${META_DEPENDS:-}"
+    else
+      if _db_is_installed "$p"; then
+        declare -A row=(); _db_get_assoc "$p" row || true
+        deps="${row[depends]:-}"
+      fi
+    fi
+    for d in $(_split_commas "${deps:-}"); do
+      [[ -z "$d" ]] && continue
+      edges["$p->$d"]=1
+      # recursively add for dependency if not processed
+      if [[ -z "${edges[$d->*]:-}" ]]; then
+        true
+      fi
+    done
+  }
+
+  # seed: build edges for resolved deps for pkg
+  while IFS= read -r p; do
+    _add_edges_for "$p"
+  done < <(resolve_deps "$pkg" "false" || true)
+
+  if [[ "$fmt" == "dot" ]]; then
+    {
+      echo "digraph deps {"
+      echo "  node [shape=box];"
+      for e in "${!edges[@]}"; do
+        local a="${e%%->*}"; local b="${e##*->}"
+        printf '  "%s" -> "%s";\n' "$a" "$b"
+      done
+      echo "}"
+    } > "${out}"
+    _dlog INFO "dep_graph_export: DOT gerado em ${out}"
+    return 0
+  elif [[ "$fmt" == "json" ]]; then
+    # simple json adjacency list
+    declare -A adj=()
+    for e in "${!edges[@]}"; do
+      local a="${e%%->*}"; local b="${e##*->}"
+      adj["$a"]="${adj[$a]:+,}${b}"
+    done
+    {
+      echo "{"
+      local first=1
+      for k in "${!adj[@]}"; do
+        local vals
+        vals="$(printf '%s' "${adj[$k]}" | sed 's/^,//')"
+        if [[ $first -eq 0 ]]; then echo ","; fi
+        first=0
+        printf '  "%s": ["%s"]' "$k" "$(echo "$vals" | sed 's/,/","/g')"
+      done
+      echo ""
+      echo "}"
+    } > "${out}"
+    _dlog INFO "dep_graph_export: JSON gerado em ${out}"
+    return 0
+  else
+    _dlog ERROR "Formato desconhecido: ${fmt}"
+    return 2
+  fi
 }
 
-# ----------------------------
-# Utility: remove installed mark
-# dep_mark_uninstalled <pkg>
-dep_mark_uninstalled() {
-  local pkg="$1"
-  dep_load
-  unset _INSTALLED_VER["$pkg"]
-  dep_save
-  _dep_log INFO "dep_mark_uninstalled: $pkg marcado como desinstalado"
-}
-
-# ----------------------------
-# CLI interface
-# ----------------------------
-_dep_usage() {
+# -------------------------
+# CLI dispatcher
+# -------------------------
+_print_help_dep() {
   cat <<EOF
 depende.sh - gerenciador de dependências
 
-Uso:
-  depende.sh --resolve <pkg>              -> lista deps recursivas (deps primeiro)
-  depende.sh --resolve-many <pkg...>     -> resolve vários pacotes (único ordenado)
-  depende.sh --add <pkg> "<dep1 dep2>"  -> adiciona no DB e salva
-  depende.sh --remove <pkg>              -> remove do DB
-  depende.sh --installed                 -> lista pacotes instalados
-  depende.sh --mark-installed <pkg> [ver] -> marca pacote instalado
-  depende.sh --check-installed <pkg>     -> retorna versão se instalado
-  depende.sh --reverse <pkg>             -> mostra quem depende de pkg
-  depende.sh --orphans                   -> lista órfãos (dry-run)
-  depende.sh --clean-orphans [auto]      -> remove órfãos; 'auto' efetua remoção
-  depende.sh --auto-install <pkg>        -> instala recursivamente dependências e o pkg
-  depende.sh --auto-build <pkg>          -> build recursivo de dependências
-  depende.sh --update-all [dry-run]      -> reconstrói todo sistema (ou apenas mostra)
-  depende.sh --save                       -> persiste DB atual (após mudanças)
-  depende.sh --help                       -> ajuda
+Usage:
+  depende.sh --resolve <pkg> [--include-opt]     : mostra ordem de construção (dependees first)
+  depende.sh --check <pkg> [--include-opt]       : checa se dependências instaladas (prints missing)
+  depende.sh --install <pkg> [--include-opt]     : resolve e auto-build dependências ausentes, registra no DB
+  depende.sh --orphans                           : lista pacotes órfãos
+  depende.sh --remove <pkg>                      : remove do DB (não remove arquivos binários)
+  depende.sh --rebuild-all                       : reconstrói todo o sistema (resolves order)
+  depende.sh --graph <pkg> [dot|json] [outfile]  : exporta grafo de dependências
+  depende.sh --list                              : lista pacotes no DB
+  depende.sh --help
+ENV:
+  DEP_DEBUG=true    - ativa logs debug
+  DEP_SILENT=true   - suprime INFO/WARN
 EOF
 }
 
-# ----------------------------
-# Main CLI dispatcher
-# ----------------------------
+# main
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  if (( $# == 0 )); then _dep_usage; exit 0; fi
+  if (( $# == 0 )); then _print_help_dep; exit 0; fi
   cmd="$1"; shift
+
   case "$cmd" in
     --resolve)
-      pkg="$1"; shift
-      dep_resolve "$pkg" "true"
+      pkg="$1"; shift || _dfail "--resolve requires <pkg>"
+      include_opt="false"
+      if [[ "${1:-}" == "--include-opt" ]]; then include_opt="true"; fi
+      resolve_deps "$pkg" "${include_opt}"
+      exit $?
       ;;
-    --resolve-many)
-      dep_resolve_many "$@"
+
+    --check)
+      pkg="$1"; shift || _dfail "--check requires <pkg>"
+      include_opt="false"
+      if [[ "${1:-}" == "--include-opt" ]]; then include_opt="true"; fi
+      dep_check_installed "$pkg" "${include_opt}"
+      exit $?
       ;;
-    --add)
-      pkg="$1"; shift
-      deps="$*"
-      dep_add "$pkg" "$deps"
+
+    --install)
+      pkg="$1"; shift || _dfail "--install requires <pkg>"
+      include_opt="false"
+      if [[ "${1:-}" == "--include-opt" ]]; then include_opt="true"; fi
+      _db_lock
+      _db_ensure
+      dep_install_missing "$pkg" "${include_opt}" || { _db_unlock; _dfail "Falha instalar dependências"; }
+      # Finally, register main package if metafile exists
+      if type meta_find >/dev/null 2>&1 && type meta_load >/dev/null 2>&1; then
+        mf="$(meta_find "$pkg" 2>/dev/null || true)"
+        if [[ -n "$mf" ]]; then
+          meta_load "$mf" TMP_META || true
+          _db_set "$pkg" "${META_VERSION:-}" "${META_DEPENDS:-}" "${META_BUILD_DEPS:-}" "${META_OPT_DEPS:-}"
+        else
+          _dlog WARN "metafile não encontrado para ${pkg}; registro no DB não efetuado"
+        fi
+      fi
+      _db_unlock
+      exit $?
       ;;
-    --remove)
-      dep_remove "$1"
-      ;;
-    --installed)
-      dep_load
-      for p in "${!_INSTALLED_VER[@]}"; do
-        printf '%s=%s\n' "$p" "${_INSTALLED_VER[$p]}"
-      done
-      ;;
-    --mark-installed)
-      dep_mark_installed "$@"
-      ;;
-    --mark-uninstalled)
-      dep_mark_uninstalled "$1"
-      ;;
-    --check-installed)
-      dep_check_installed "$1" && exit 0 || exit 1
-      ;;
-    --reverse)
-      dep_reverse "$1"
-      ;;
+
     --orphans)
-      dep_orphans
+      dep_list_orphans
+      exit $?
       ;;
-    --clean-orphans)
-      mode="${1:-dry-run}"
-      dep_clean_orphans "$mode"
+
+    --remove)
+      pkg="$1"; shift || _dfail "--remove requires <pkg>"
+      _db_lock
+      _db_remove "$pkg"
+      _db_unlock
+      exit 0
       ;;
-    --auto-install)
-      dep_auto_install "$1"
+
+    --rebuild-all)
+      _db_lock
+      dep_rebuild_all || { _db_unlock; _dfail "rebuild-all falhou"; }
+      _db_unlock
+      exit 0
       ;;
-    --auto-build)
-      dep_auto_build "$1"
+
+    --graph)
+      pkg="$1"; fmt="${2:-dot}"; out="${3:-}"
+      out="${out:-${GRAPH_DIR}/${pkg}-graph.${fmt}}"
+      dep_graph_export "$pkg" "$fmt" "$out"
+      exit $?
       ;;
-    --update-all)
-      mode="${1:-run}"
-      dep_update_all "$mode"
+
+    --list)
+      _db_list_pkgs
+      exit 0
       ;;
-    --save)
-      dep_save
-      ;;
+
     --help|-h)
-      _dep_usage
+      _print_help_dep
+      exit 0
       ;;
+
     *)
-      _dep_log ERROR "Comando inválido: $cmd"
-      _dep_usage
+      _print_help_dep
       exit 2
       ;;
   esac
 fi
 
-# ----------------------------
-# Export key functions for sourcing
-# ----------------------------
-export -f dep_load dep_save dep_add dep_remove dep_resolve dep_resolve_many \
-  dep_orphans dep_clean_orphans dep_auto_install dep_auto_build dep_update_all \
-  dep_mark_installed dep_mark_uninstalled dep_check_installed dep_reverse
+# export functions for other scripts (build.sh, update.sh, uninstall.sh)
+export -f resolve_deps dep_check_installed dep_install_missing dep_list_orphans dep_rebuild_all dep_graph_export _db_is_installed _db_set _db_get_line
