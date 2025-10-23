@@ -1,476 +1,589 @@
 #!/usr/bin/env bash
-# metafile.sh - Carregador de metafiles integrado com sandbox/hooks/downloader/patches
+# metafile.sh - gerenciador de metafiles (.ini) para orquestrador LFS
+# Funções: meta_create, meta_load, meta_validate, meta_write (atômico), meta_backup, meta_diff, meta_list, meta_set/get, meta_export_env
+# Integração com register.sh (register_info, register_warn, register_error, register_debug)
+# Suporte a campos opcionais: build_deps,opt_deps,patches,hooks,sources,sha256sums,depends,category,description,urls
 # Versão: 2025-10-23
+
 set -eEuo pipefail
 IFS=$'\n\t'
+umask 027
 
-SCRIPT_NAME="metafile"
-SCRIPT_VERSION="1.0.0"
+# -------------------------
+# Configuráveis por ENV
+# -------------------------
+: "${META_DIRS:=/usr/src /mnt/lfs/usr/src /usr/src/repo /mnt/lfs/usr/src/repo}"
+: "${META_DEFAULT_DIR:=/usr/src}"
+: "${META_LOG_DIR:=/var/log/orquestrador/metafile}"
+: "${META_LOCK_DIR:=/run/lock/orquestrador}"
+: "${META_BACKUP_RETENTION:=10}"   # número de backups a manter por metafile
+: "${META_TMP_DIR:=/var/tmp/orquestrador/metafile}"
+: "${META_SILENT:=false}"
+: "${META_DEBUG:=false}"
+: "${META_FILEMODE:=0640}"
 
-# -----------------------
-# Configurações padrão (podem ser sobrescritas via env)
-# -----------------------
-: "${LFS:=/mnt/lfs}"
-: "${SRC_DIR:=/usr/src}"
-: "${LFS_SRC_DIR:=/mnt/lfs/usr/src}"
-: "${CACHE_SOURCES:=/var/cache/sources}"
-: "${CACHE_BINARIES:=/var/cache/binaries}"
-: "${MF_SILENT:=false}"
-: "${MF_DEBUG:=false}"
-: "${MF_JOBS:=$(nproc)}"
-: "${SANDBOX_USE:=true}"         # true/false - use sandbox when available
-: "${SANDBOX_PERSIST:=false}"    # preserve sandbox after build
-: "${SANDBOX_MODE:=auto}"        # auto / chroot / unshare
-: "${RSYNC_BIN:=$(command -v rsync || true)}"
+# runtime
+_SESSION_TS="$(date -u +"%Y%m%dT%H%M%SZ")-$$"
+_LOCK_FD=""
+mkdir -p "${META_LOG_DIR}" "${META_TMP_DIR}" "${META_LOCK_DIR}" 2>/dev/null || true
 
-# -----------------------
-# Runtime vars
-# -----------------------
-BUILD_DIR="${BUILD_DIR:-/tmp/build.$$}"
-PKG_DIR=""            # /usr/src/<category>/<pkg>
-MF_FILE=""
-_SANDBOX_SESSION=""   # provided by sandbox.sh when sourced (internal var)
-SANDBOX_WORKDIR="/work" # inside sandbox
-# -----------------------
-# Logging (integrates with register.sh if present)
-# -----------------------
-log() {
+# -------------------------
+# Logging helpers (register integration)
+# -------------------------
+_meta_log() {
   local level="$1"; shift
   local msg="$*"
   if type register_info >/dev/null 2>&1; then
     case "$level" in
-      INFO)  register_info "$msg";;
-      WARN)  register_warn "$msg";;
-      ERROR) register_error "$msg";;
-      DEBUG) register_debug "$msg";;
-      *) register_info "$msg";;
+      INFO) register_info "$msg"; return 0 ;;
+      WARN) register_warn "$msg"; return 0 ;;
+      ERROR) register_error "$msg"; return 0 ;;
+      DEBUG) register_debug "$msg"; return 0 ;;
+      *) register_info "$msg"; return 0 ;;
     esac
+  fi
+  if [[ "${META_SILENT}" == "true" && "$level" != "ERROR" ]]; then
+    return 0
+  fi
+  case "$level" in
+    INFO)  printf '\e[32m[INFO]\e[0m %s\n' "$msg" ;;
+    WARN)  printf '\e[33m[WARN]\e[0m %s\n' "$msg" >&2 ;;
+    ERROR) printf '\e[31m[ERROR]\e[0m %s\n' "$msg" >&2 ;;
+    DEBUG) [[ "${META_DEBUG}" == "true" ]] && printf '\e[36m[DEBUG]\e[0m %s\n' "$msg" ;;
+    *) printf '[LOG] %s\n' "$msg" ;;
+  esac
+  # append to log file
+  local logfile="${META_LOG_DIR}/metafile-${_SESSION_TS}.log"
+  printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "[$level]" "$msg" >> "${logfile}" 2>/dev/null || true
+}
+
+_meta_fail() {
+  local msg="$1"; local code="${2:-1}"
+  _meta_log ERROR "$msg"
+  exit "$code"
+}
+
+# -------------------------
+# Lock helpers (global)
+# -------------------------
+_meta_acquire_lock() {
+  local lf="${META_LOCK_DIR}/metafile.lock"
+  exec {META_LOCK_FD}>"${lf}" || _meta_fail "Não pode abrir lock ${lf}"
+  if flock -n "${META_LOCK_FD}"; then
+    _meta_log DEBUG "Lock global metafile adquirido"
+    return 0
+  fi
+  _meta_log INFO "Aguardando lock global em ${lf}..."
+  local waited=0
+  local timeout="${META_LOCK_TIMEOUT:-300}"
+  while ! flock -n "${META_LOCK_FD}"; do
+    sleep 1
+    waited=$((waited+1))
+    if (( waited >= timeout )); then
+      _meta_fail "Timeout aguardando lock global (${timeout}s)"
+    fi
+  done
+  _meta_log DEBUG "Lock global adquirido após ${waited}s"
+}
+
+_meta_release_lock() {
+  if [[ -n "${META_LOCK_FD:-}" ]]; then
+    eval "exec ${META_LOCK_FD}>&-"
+    unset META_LOCK_FD
+  fi
+}
+
+# -------------------------
+# Helpers
+# -------------------------
+_realpath() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1"
   else
-    [[ "${MF_SILENT}" == "true" && "$level" != "ERROR" ]] && return 0
-    case "$level" in
-      INFO)  printf '\e[32m[INFO]\e[0m %s\n' "$msg" ;;
-      WARN)  printf '\e[33m[WARN]\e[0m %s\n' "$msg" >&2 ;;
-      ERROR) printf '\e[31m[ERROR]\e[0m %s\n' "$msg" >&2 ;;
-      DEBUG) [[ "${MF_DEBUG}" == "true" ]] && printf '\e[36m[DEBUG]\e[0m %s\n' "$msg" ;;
-      *) echo "[LOG] $msg";;
-    esac
+    (cd "$(dirname "$1")" 2>/dev/null && echo "$(pwd -P)/$(basename "$1")")" || echo "$1"
   fi
 }
-fail() { log ERROR "$*"; exit 1; }
 
-safe_mkdir() { mkdir -p "$1" 2>/dev/null || fail "Não foi possível criar diretório $1"; chmod 750 "$1" || true; }
+_safe_mkdir() {
+  mkdir -p "$1" 2>/dev/null || _meta_fail "Falha ao criar diretório $1"
+  chmod 750 "$1" 2>/dev/null || true
+}
 
-# -----------------------
-# Auto-load modules (register, downloader, patches, hooks, sandbox)
-# -----------------------
-for mod in register downloader patches hooks sandbox; do
-  if ! type "${mod}_init" >/dev/null 2>&1 && [[ -f /usr/bin/${mod}.sh ]]; then
-    # shellcheck disable=SC1090
-    source /usr/bin/${mod}.sh || log WARN "Falha ao carregar ${mod}.sh"
-    log INFO "${mod}.sh carregado de /usr/bin"
-    # try init for modules that define it
-    if type "${mod}_init" >/dev/null 2>&1; then
-      "${mod}_init" || log WARN "Inicialização ${mod}_init retornou não-zero"
-    fi
-  elif ! type "${mod}_init" >/dev/null 2>&1 && [[ -f /mnt/lfs/usr/bin/${mod}.sh ]]; then
-    # shellcheck disable=SC1090
-    source /mnt/lfs/usr/bin/${mod}.sh || log WARN "Falha ao carregar ${mod}.sh (LFS)"
-    log INFO "${mod}.sh (LFS) carregado"
-    if type "${mod}_init" >/dev/null 2>&1; then
-      "${mod}_init" || log WARN "Inicialização ${mod}_init retornou não-zero"
-    fi
+# atomic write helper: write to tmp then mv
+_atomic_write() {
+  local target="$1"; local tmp; tmp="$(mktemp "${META_TMP_DIR}/metafile.tmp.XXXX")"
+  cat > "$tmp" || return 1
+  mv -f "$tmp" "$target" || return 2
+  chmod "${META_FILEMODE}" "$target" 2>/dev/null || true
+  return 0
+}
+
+# sanitize key/value lines (keep safe chars)
+_sanitize_kv_line() {
+  local k="$1"; local v="$2"
+  # remove control chars, keep printable
+  k="$(printf '%s' "$k" | tr -cd '[:alnum:]._-')"
+  v="$(printf '%s' "$v" | sed -E 's/[\r\n]+/ /g' | sed -E 's/[[:cntrl:]]//g')"
+  printf '%s=%s\n' "$k" "$v"
+}
+
+# timestamp suffix
+_ts() { date -u +"%Y%m%dT%H%M%SZ"; }
+
+# -------------------------
+# meta_find - locate metafile by package name or path
+# Usage: meta_find <pkg_or_path>
+# Returns path on stdout; exit 0 if found else non-zero
+# -------------------------
+meta_find() {
+  local what="$1"
+  # if path exists and is file -> return
+  if [[ -f "$what" ]]; then
+    printf '%s' "$(realpath "$what")"
+    return 0
   fi
-done
-
-# -----------------------
-# Data structures for metafile
-# -----------------------
-declare MF_NAME MF_VERSION MF_DESCRIPTION MF_CATEGORY MF_ARCH MF_HOOKS MF_ENV_FLAGS
-declare -a MF_URLS=() MF_SHA256S=() MF_PATCHES=() MF_PATCH_SHA256S=()
-
-sanitize_key() { echo "$1" | sed -E 's/[^A-Za-z0-9_.-]//g'; }
-sanitize_value() { echo "$1" | sed -E 's/[;`$]//g'; }
-
-# -----------------------
-# Parse metafile (simple ini-like)
-# -----------------------
-mf_load() {
-  MF_FILE="$1"
-  [[ -f "$MF_FILE" ]] || fail "Metafile não encontrado: $MF_FILE"
-  log INFO "Carregando metafile: $MF_FILE"
-  # reset
-  MF_NAME=""; MF_VERSION=""; MF_DESCRIPTION=""; MF_CATEGORY=""; MF_ARCH=""
-  MF_HOOKS=""; MF_ENV_FLAGS=""
-  MF_URLS=(); MF_SHA256S=(); MF_PATCHES=(); MF_PATCH_SHA256S=()
-  while IFS='=' read -r rawk rawv || [[ -n "$rawk" ]]; do
-    [[ "$rawk" =~ ^[[:space:]]*# ]] && continue
-    [[ -z "$rawk" ]] && continue
-    key=$(sanitize_key "${rawk// /}")
-    value=$(sanitize_value "${rawv}")
-    value=$(echo "$value" | xargs)
-    case "$key" in
-      name) MF_NAME="$value" ;;
-      version) MF_VERSION="$value" ;;
-      description) MF_DESCRIPTION="$value" ;;
-      category) MF_CATEGORY="$value" ;;
-      arch) MF_ARCH="$value" ;;
-      urls) read -ra MF_URLS <<<"$value" ;;
-      sha256sums) read -ra MF_SHA256S <<<"$value" ;;
-      patches) read -ra MF_PATCHES <<<"$value" ;;
-      patchsha256sums) read -ra MF_PATCH_SHA256S <<<"$value" ;;
-      envflags) MF_ENV_FLAGS="$value" ;;
-      hooks) MF_HOOKS="$value" ;;
-      *) log DEBUG "Ignorando chave desconhecida: $key" ;;
-    esac
-  done < "$MF_FILE"
-
-  [[ -z "${MF_NAME:-}" ]] && fail "Campo 'name' ausente no metafile"
-  MF_CATEGORY="${MF_CATEGORY:-misc}"
-  PKG_DIR="${SRC_DIR}/${MF_CATEGORY}/${MF_NAME}"
-  log INFO "Metafile carregado: ${MF_NAME} ${MF_VERSION} (categoria: ${MF_CATEGORY})"
-}
-
-# -----------------------
-# Utility: expand variables in strings (NAME, VERSION)
-# -----------------------
-mf_expand_vars() {
-  local text="$1"
-  text="${text//\$\{NAME\}/${MF_NAME}}"
-  text="${text//\$\{VERSION\}/${MF_VERSION}}"
-  echo "$text"
-}
-
-# -----------------------
-# Downloader integration (fetch sources via dl_fetch when available)
-# -----------------------
-mf_fetch_sources() {
-  safe_mkdir "${CACHE_SOURCES}"
-  [[ ${#MF_URLS[@]} -eq 0 ]] && { log WARN "Nenhum source definido"; return 0; }
-  local idx=0
-  for u in "${MF_URLS[@]}"; do
-    local expanded; expanded=$(mf_expand_vars "$u")
-    local sha="${MF_SHA256S[$idx]:-}"
-    idx=$((idx+1))
-    if type dl_fetch >/dev/null 2>&1; then
-      log INFO "Baixando via downloader: $expanded"
-      dl_fetch "$expanded" "$sha" || fail "dl_fetch falhou para $expanded"
-    else
-      local fname; fname=$(basename "${expanded%%\?*}")
-      local dest="${CACHE_SOURCES}/${fname}"
-      if [[ -f "$dest" ]]; then
-        log INFO "Fonte em cache: $fname"
-      else
-        log INFO "Baixando com curl: $expanded"
-        curl -L --fail --silent --show-error -o "$dest" "$expanded" || fail "Falha no download $expanded"
+  # search by name across META_DIRS
+  for d in ${META_DIRS}; do
+    if [[ -d "${d}" ]]; then
+      # exact name.ini or name.meta
+      local f
+      f=$(find "${d}" -maxdepth 4 -type f \( -iname "${what}.ini" -o -iname "${what}.meta" -o -iname "${what}*.ini" \) 2>/dev/null | head -n1 || true)
+      if [[ -n "$f" ]]; then
+        printf '%s' "$f"
+        return 0
       fi
-      if [[ -n "$sha" ]]; then
-        if ! sha256sum -c <(echo "${sha}  ${dest}") >/dev/null 2>&1; then
-          rm -f "$dest" || true
-          fail "Checksum inválido para $expanded"
-        fi
+      # directory style /category/pkg/*.ini
+      f=$(find "${d}" -maxdepth 5 -type f -path "*/${what}/*.ini" 2>/dev/null | head -n1 || true)
+      if [[ -n "$f" ]]; then
+        printf '%s' "$f"
+        return 0
       fi
     fi
   done
+  return 1
 }
-
-# -----------------------
-# Apply patches (use patches.sh if available)
-# -----------------------
-mf_apply_patches() {
-  [[ ${#MF_PATCHES[@]} -eq 0 ]] && { log INFO "Nenhum patch definido"; return 0; }
-  log INFO "Aplicando patches (${#MF_PATCHES[@]})"
-  if type pt_fetch_all >/dev/null 2>&1 && type pt_apply_all >/dev/null 2>&1; then
-    pt_fetch_all "${MF_PATCHES[@]}" || fail "pt_fetch_all falhou"
-    pt_apply_all "${MF_PATCHES[@]}" || fail "pt_apply_all falhou"
+# -------------------------
+# meta_list - list available metafiles (print paths)
+# Usage: meta_list [dir]
+# -------------------------
+meta_list() {
+  local dir="${1:-}"
+  if [[ -n "$dir" ]]; then
+    if [[ -d "$dir" ]]; then
+      find "$dir" -maxdepth 4 -type f -iname "*.ini" -o -iname "*.meta" 2>/dev/null || true
+    else
+      _meta_log WARN "Diretório não existe: $dir"
+      return 1
+    fi
   else
-    # fallback: try to apply local patches if they exist in package dir
-    for p in "${MF_PATCHES[@]}"; do
-      local pf; pf=$(mf_expand_vars "$p")
-      if [[ -f "$pf" ]]; then
-        log INFO "Aplicando patch local: $pf"
-        (cd "${BUILD_DIR}" && patch -Np1 -i "$pf") || fail "Falha ao aplicar patch $pf"
-      else
-        log WARN "Patch não encontrado: $pf (pulando)"
+    for d in ${META_DIRS}; do
+      if [[ -d "$d" ]]; then
+        find "$d" -maxdepth 4 -type f \( -iname "*.ini" -o -iname "*.meta" \) 2>/dev/null || true
       fi
     done
   fi
 }
+# -------------------------
+# meta_load - parse a metafile into associative array and export META_* globals
+# Usage: meta_load <file> [assoc_name]  # assoc_name optional to receive associative array by name
+# Exports globals: META_NAME, META_VERSION, META_URLS, META_SHA256S, META_DEPENDS, META_CATEGORY
+# -------------------------
+meta_load() {
+  local file="$1"; local out_assoc="$2"
+  if [[ -z "$file" ]]; then _meta_fail "meta_load: file required"; fi
+  if [[ ! -f "$file" ]]; then _meta_fail "meta_load: metafile não encontrado: $file"; fi
 
-# -----------------------
-# Sandbox helpers: sync sources into sandbox and back
-# -----------------------
-# Note: sandbox.sh when sourced creates function sandbox_create and exposes internal _SANDBOX_SESSION variable.
-# We rely on sandbox_create/sandbox_run/sandbox_mount_pseudofs/sandbox_cleanup being available if sandbox.sh is sourced.
-_sandbox_available() {
-  type sandbox_run >/dev/null 2>&1
-}
+  declare -A meta_tmp=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # strip comments
+    line="${line%%#*}"
+    line="${line%%;*}"
+    line="$(echo -n "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^([A-Za-z0-9_.-]+)=(.*)$ ]]; then
+      local k="${BASH_REMATCH[1]}"
+      local v="${BASH_REMATCH[2]}"
+      # trim
+      v="$(echo -n "$v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+      meta_tmp["$k"]="$v"
+    fi
+  done < "$file"
 
-_sync_to_sandbox() {
-  # $1 -> host_dir (full path), copies into ${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}/
-  local host_dir="${1:-}"
-  if [[ -z "$host_dir" || ! -d "$host_dir" ]]; then
-    log ERROR "sync_to_sandbox: diretório inválido: $host_dir"; return 2
+  # export common fields
+  META_NAME="${meta_tmp[name]:-${meta_tmp[package]:-}}"
+  META_VERSION="${meta_tmp[version]:-${meta_tmp[${META_NAME}.version]:-}}"
+  META_URLS="${meta_tmp[urls]:-${meta_tmp[url]:-${meta_tmp[${META_NAME}.url]:-}}}"
+  META_SHA256S="${meta_tmp[sha256sums]:-${meta_tmp[sha256]:-}}"
+  META_DEPENDS="${meta_tmp[depends]:-}"
+  META_CATEGORY="${meta_tmp[category]:-}"
+  META_DESCRIPTION="${meta_tmp[description]:-}"
+  META_SOURCES="${meta_tmp[sources]:-}"
+  META_PATCHES="${meta_tmp[patches]:-}"
+  META_HOOKS="${meta_tmp[hooks]:-}"
+  META_BUILD_DEPS="${meta_tmp[build_deps]:-}"
+  META_OPT_DEPS="${meta_tmp[opt_deps]:-}"
+
+  # export as associative if requested
+  if [[ -n "${out_assoc:-}" ]]; then
+    # create assoc in caller by name using eval
+    eval "declare -g -A ${out_assoc} || true"
+    for k in "${!meta_tmp[@]}"; do
+      local v="${meta_tmp[$k]}"
+      # escape quotes
+      v="${v//\"/\\\"}"
+      eval "${out_assoc}[\"$k\"]=\"$v\""
+    done
   fi
-  if [[ -z "${_SANDBOX_SESSION:-}" || ! -d "${_SANDBOX_SESSION}/root" ]]; then
-    log ERROR "sync_to_sandbox: sessão sandbox inexistente"; return 3
-  fi
-  local destroot="${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}"
-  mkdir -p "${destroot}" || { log ERROR "Falha criar ${destroot}"; return 4; }
-  if [[ -n "${RSYNC_BIN}" ]]; then
-    "${RSYNC_BIN}" -a --delete --numeric-ids --no-perms --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r "${host_dir}/" "${destroot}/" || { log ERROR "rsync falhou"; return 5; }
-  else
-    # fallback: tar over pipe (preserve basic attrs)
-    (cd "${host_dir}" && tar cf - .) | (cd "${destroot}" && tar xf -) || { log ERROR "tar copy falhou"; return 6; }
-  fi
-  log INFO "Sincronizado para sandbox: ${host_dir} -> ${destroot}"
+
+  export META_NAME META_VERSION META_URLS META_SHA256S META_DEPENDS META_CATEGORY META_DESCRIPTION META_SOURCES META_PATCHES META_HOOKS META_BUILD_DEPS META_OPT_DEPS
+  _meta_log DEBUG "meta_load: ${file} -> name=${META_NAME:-<none>} version=${META_VERSION:-<none>}"
   return 0
 }
+# -------------------------
+# meta_validate - basic validation of metafile, returns 0 if ok, non-zero otherwise
+# checks: name present, version present (not mandatory?), url or sources present, sha if url present optionally
+# -------------------------
+meta_validate() {
+  local file="$1"
+  if [[ -z "$file" ]]; then _meta_fail "meta_validate: file required"; fi
+  if [[ ! -f "$file" ]]; then _meta_fail "meta_validate: file not found: $file"; fi
 
-_sync_from_sandbox() {
-  # $1 -> host_dir (full path), pulls from ${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}/ back to host_dir
-  local host_dir="${1:-}"
-  if [[ -z "$host_dir" ]]; then log ERROR "sync_from_sandbox: host_dir vazio"; return 2; fi
-  if [[ -z "${_SANDBOX_SESSION:-}" || ! -d "${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}" ]]; then
-    log WARN "sync_from_sandbox: caminho no sandbox não existe; nada a sincronizar"; return 0
+  # load to env
+  meta_load "$file" META_TMP || return 2
+
+  local ok=0
+  if [[ -z "${META_NAME:-}" ]]; then
+    _meta_log ERROR "meta_validate: campo 'name' ausente em $file"
+    ok=1
   fi
-  local srcroot="${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}"
-  mkdir -p "${host_dir}" || { log ERROR "Falha criar ${host_dir}"; return 3; }
-  if [[ -n "${RSYNC_BIN}" ]]; then
-    "${RSYNC_BIN}" -a --delete --numeric-ids --no-perms --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r "${srcroot}/" "${host_dir}/" || { log WARN "rsync pull falhou"; return 4; }
-  else
-    (cd "${srcroot}" && tar cf - .) | (cd "${host_dir}" && tar xf -) || { log WARN "tar pull falhou"; return 5; }
+  if [[ -z "${META_URLS:-}" && -z "${META_SOURCES:-}" ]]; then
+    _meta_log WARN "meta_validate: nem 'url(s)' nem 'sources' definidos em $file (pode ser intencional)"
+    # not fatal; allow sources-only metafile
   fi
-  log INFO "Sincronizado do sandbox: ${srcroot} -> ${host_dir}"
+  # if URL provided but no sha, warn (not fatal)
+  if [[ -n "${META_URLS:-}" && -z "${META_SHA256S:-}" ]]; then
+    _meta_log WARN "meta_validate: URL presente mas sem sha256sums em $file (recomenda-se adicionar)"
+  fi
+
+  # validate optional lists: ensure no invalid characters
+  for fld in META_PATCHES META_HOOKS META_BUILD_DEPS META_OPT_DEPS; do
+    local val="${!fld:-}"
+    if [[ -n "$val" ]]; then
+      # ensure delimiter comma or semicolon or space allowed
+      if ! printf '%s' "$val" | grep -qE '[A-Za-z0-9._/,-]'; then
+        _meta_log WARN "meta_validate: campo ${fld} tem caracteres incomuns"
+      fi
+    fi
+  done
+
+  return $ok
+}
+
+# -------------------------
+# meta_backup - create backup copy with timestamp, keep retention count
+# Usage: meta_backup <file>
+# -------------------------
+meta_backup() {
+  local file="$1"
+  [[ -f "$file" ]] || { _meta_log WARN "meta_backup: file not found: $file"; return 1; }
+  local ts; ts="$(_ts)"
+  local bak="${file}.bak.${ts}"
+  cp -a "$file" "${bak}" || { _meta_log ERROR "meta_backup: falha ao criar backup ${bak}"; return 2; }
+  _meta_log INFO "Backup criado: ${bak}"
+  # cleanup older backups
+  local dir; dir="$(dirname "$file")"; local base; base="$(basename "$file")"
+  local list; IFS=$'\n' read -r -d '' -a list < <(find "${dir}" -maxdepth 1 -type f -name "${base}.bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}' && printf '\0')
+  local cnt="${#list[@]}"
+  if (( cnt > META_BACKUP_RETENTION )); then
+    local toremove=$((cnt - META_BACKUP_RETENTION))
+    for ((i=0;i<toremove;i++)); do
+      rm -f "${list[i]}" || true
+      _meta_log DEBUG "meta_backup: removed old backup ${list[i]}"
+    done
+  fi
   return 0
 }
+# -------------------------
+# meta_write - atomic update of metafile
+# Usage: meta_write <file> <assoc_var_name_with_updates>
+# The assoc var is name of associative array in caller containing key->value pairs to be set/added
+# -------------------------
+meta_write() {
+  local file="$1"; local assoc_name="$2"
+  if [[ -z "$file" || -z "$assoc_name" ]]; then _meta_fail "meta_write: file and assoc name required"; fi
+  if [[ ! -f "$file" ]]; then _meta_fail "meta_write: target file not found: $file"; fi
 
-# -----------------------
-# Stage functions
-# -----------------------
-mf_prepare() {
-  log INFO "[PREPARE] Preparando ambiente"
-  # ensure build dir
-  rm -rf "${BUILD_DIR}" || true
-  safe_mkdir "${BUILD_DIR}"
-  # find a tarball in cache (simple heuristic)
-  local tarball
-  tarball=$(find "${CACHE_SOURCES}" -maxdepth 1 -type f -name "${MF_NAME}-*.*" | head -n1 || true)
-  if [[ -z "${tarball}" ]]; then
-    # try any archive
-    tarball=$(find "${CACHE_SOURCES}" -maxdepth 1 -type f | head -n1 || true)
-  fi
-  [[ -n "${tarball}" && -f "${tarball}" ]] || fail "Tarball não encontrado em ${CACHE_SOURCES}"
-  log INFO "Usando tarball: ${tarball}"
-  # extract into BUILD_DIR
-  tar -xf "${tarball}" -C "${BUILD_DIR}" --strip-components=1 || fail "Falha ao extrair ${tarball}"
-  # prepare sandbox workdir: copy sources into sandbox /work
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available); then
-    # ensure sandbox session
-    if ! sandbox_create >/dev/null 2>&1; then
-      fail "Falha ao criar sessão sandbox"
+  # create backup first
+  meta_backup "$file" || _meta_log WARN "meta_write: backup may have failed"
+
+  # read assoc into local
+  declare -n updates="$assoc_name"
+
+  local tmp; tmp="$(mktemp "${META_TMP_DIR}/mf.tmp.XXXX")" || _meta_fail "meta_write: mktemp failed"
+  # mark replaced keys
+  declare -A replaced=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # preserve comments/blank lines
+    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$(echo -n "$line" | sed -E 's/[[:space:]]+//g')" ]]; then
+      printf '%s\n' "$line" >> "$tmp"
+      continue
     fi
-    sandbox_mount_pseudofs >/dev/null 2>&1 || log WARN "Falha mount pseudo-fs (continuando)"
-    # create the destination inside sandbox root
-    # note: _SANDBOX_SESSION is internal var from sandbox.sh; assume accessible after sourcing
-    if [[ -z "${_SANDBOX_SESSION:-}" ]]; then
-      fail "Sandbox session não definida após sandbox_create()"
-    fi
-    # ensure the /work path exists inside session root
-    mkdir -p "${_SANDBOX_SESSION}/root${SANDBOX_WORKDIR}" || fail "Falha criar sandbox workdir"
-    # sync sources
-    _sync_to_sandbox "${BUILD_DIR}" || fail "Falha ao sincronizar fontes para sandbox"
-  else
-    log INFO "SANDBOX não usado - operando no host em ${BUILD_DIR}"
-  fi
-}
-
-mf_configure() {
-  log INFO "[CONFIGURE] Configurando build"
-  # build env flags exported
-  if [[ -n "${MF_ENV_FLAGS:-}" ]]; then
-    # shellcheck disable=SC2086
-    export ${MF_ENV_FLAGS}
-  fi
-
-  # decide where to run
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    # inside sandbox: run configure in /work
-    local cfg_cmd=""
-    cfg_cmd+="if [[ -f ./configure ]]; then ./configure --prefix=/usr; elif [[ -f CMakeLists.txt ]]; then cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr; elif [[ -f meson.build ]]; then meson setup build --prefix=/usr; else echo 'Nenhum sistema de build detectado'; fi"
-    sandbox_run "cd ${SANDBOX_WORKDIR} && ${cfg_cmd}" || fail "configure falhou dentro do sandbox"
-  else
-    # host mode
-    (cd "${BUILD_DIR}" && \
-      if [[ -f "./configure" ]]; then \
-        ./configure --prefix=/usr; \
-      elif [[ -f CMakeLists.txt ]]; then \
-        cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr; \
-      elif [[ -f meson.build ]]; then \
-        meson setup build --prefix=/usr; \
-      else \
-        log WARN "Nenhum sistema de build detectado"; \
-      fi) || fail "configure falhou no host"
-  fi
-}
-
-mf_build() {
-  log INFO "[BUILD] Compilando"
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    sandbox_run "cd ${SANDBOX_WORKDIR} && if [[ -d build ]]; then cd build; fi && make -j${MF_JOBS}" || fail "make falhou dentro do sandbox"
-  else
-    (cd "${BUILD_DIR}" && if [[ -d build ]]; then cd build; fi && make -j"${MF_JOBS}") || fail "make falhou no host"
-  fi
-}
-
-mf_check() {
-  log INFO "[CHECK] Executando testes (se aplicável)"
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    sandbox_run "cd ${SANDBOX_WORKDIR} && if [[ -d build ]]; then cd build; fi && make -k check" || log WARN "make check falhou dentro do sandbox"
-  else
-    (cd "${BUILD_DIR}" && if [[ -d build ]]; then cd build; fi && make -k check) || log WARN "make check falhou no host"
-  fi
-}
-
-mf_install() {
-  log INFO "[INSTALL] Instalando"
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    sandbox_run "cd ${SANDBOX_WORKDIR} && if [[ -d build ]]; then cd build; fi && make install" || fail "make install falhou dentro do sandbox"
-    # optionally sync built artifacts back to host build dir
-    _sync_from_sandbox "${BUILD_DIR}" || log WARN "Falha ao sincronizar artefatos do sandbox"
-  else
-    (cd "${BUILD_DIR}" && if [[ -d build ]]; then cd build; fi && make install) || fail "make install falhou no host"
-  fi
-}
-
-mf_uninstall() {
-  log INFO "[UNINSTALL] Removendo (simples)"
-  # Best-effort removal: remove files named after package (conservative)
-  if [[ -z "${MF_NAME:-}" ]]; then fail "mf_uninstall: name não definido"; fi
-  log WARN "mf_uninstall faz remoção simples; verifique manualmente"
-  find /usr -type f -name "${MF_NAME}*" -exec rm -f {} \; || true
-}
-
-mf_summary() {
-  log INFO "[SUMMARY] ${MF_NAME}-${MF_VERSION} concluído"
-  if type hooks_summary >/dev/null 2>&1; then hooks_summary || true; fi
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    if [[ "${SANDBOX_PERSIST}" == "false" ]]; then
-      sandbox_cleanup || log WARN "Falha ao limpar sandbox"
+    if [[ "$line" =~ ^([A-Za-z0-9_.-]+)=(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      if [[ -n "${updates[$key]:-}" ]]; then
+        printf '%s=%s\n' "$key" "${updates[$key]}" >> "$tmp"
+        replaced["$key"]=1
+      else
+        printf '%s\n' "$line" >> "$tmp"
+      fi
     else
-      log INFO "Sandbox preservado (SANDBOX_PERSIST=true): ${_SANDBOX_SESSION:-<unknown>}"
+      # unknown line, keep
+      printf '%s\n' "$line" >> "$tmp"
     fi
-  fi
-}
+  done < "$file"
 
-# -----------------------
-# Runner to call mf_* with pre/post hooks
-# -----------------------
-mf_run_stage() {
-  local stage="$1"
-  log DEBUG "Executando etapa: $stage"
-  # pre-hook
-  if type hooks_run >/dev/null 2>&1; then
-    hooks_run "pre-${stage}" "${BUILD_DIR}" "${PKG_DIR}" || { log ERROR "pre-${stage} hook falhou"; return 10; }
+  # append new keys not replaced
+  for k in "${!updates[@]}"; do
+    if [[ -z "${replaced[$k]:-}" ]]; then
+      printf '%s=%s\n' "$k" "${updates[$k]}" >> "$tmp"
+    fi
+  done
+
+  # atomic move
+  mv -f "$tmp" "$file" || { cp -a "${file}.bak.${_SESSION_TS}" "$file"; _meta_fail "meta_write: mv failed, restored backup"; }
+  chmod "${META_FILEMODE}" "$file" 2>/dev/null || true
+  _meta_log INFO "meta_write: atualizado ${file}"
+  return 0
+}
+# -------------------------
+# meta_create - generate a new metafile skeleton
+# Usage: meta_create <category> <name> [dir]
+# If dir not provided, uses META_DEFAULT_DIR/<category>/<name>.ini
+# -------------------------
+meta_create() {
+  local category="$1"; local name="$2"; local dir="${3:-}"
+  if [[ -z "$category" || -z "$name" ]]; then _meta_fail "meta_create: usage: meta_create <category> <name> [dir]"; fi
+
+  local base_dir="${dir:-${META_DEFAULT_DIR}/${category}/${name}}"
+  _safe_mkdir "${base_dir}"
+  local file="${base_dir}/${name}.ini"
+
+  if [[ -f "$file" ]]; then
+    _meta_log WARN "meta_create: file already exists: $file"
+    return 1
   fi
-  # call stage
-  "mf_${stage}" || { log ERROR "Erro na etapa ${stage}"; return 20; }
-  # post-hook (non-fatal)
-  if type hooks_run >/dev/null 2>&1; then
-    hooks_run "post-${stage}" "${BUILD_DIR}" "${PKG_DIR}" || log WARN "post-${stage} hook falhou"
-  fi
+
+  cat > "$file" <<'EOF'
+# Metafile generated by metafile.sh
+# Edit values as needed
+name=__NAME__
+version=0.0.1
+urls=https://example.org/__NAME__-__VERSION__.tar.xz
+sha256sums=
+category=__CATEGORY__
+depends=
+build_deps=
+opt_deps=
+sources=
+patches=
+hooks=
+description=Example package __NAME__
+EOF
+
+  # replace tokens
+  sed -i "s|__NAME__|${name}|g; s|__CATEGORY__|${category}|g; s|__VERSION__|0.0.1|g" "$file"
+  chmod "${META_FILEMODE}" "$file" 2>/dev/null || true
+  _meta_log INFO "meta_create: criado $file"
   return 0
 }
 
-# -----------------------
-# Top-level construction flow
-# -----------------------
-mf_construction() {
-  # pre-check: make sure sandbox is created if requested
-  if [[ "${SANDBOX_USE}" == "true" && $(_sandbox_available) ]]; then
-    log INFO "Sandbox requested; ensuring session"
-    sandbox_create || fail "sandbox_create falhou"
-    sandbox_mount_pseudofs || log WARN "sandbox_mount_pseudofs falhou"
-  else
-    log INFO "Construindo sem sandbox (SANDBOX_USE=false ou sandbox não disponível)"
+# -------------------------
+# meta_get_field - print a field value
+# Usage: meta_get_field <field> <file>
+# -------------------------
+meta_get_field() {
+  local field="$1"; local file="$2"
+  if [[ -z "$field" || -z "$file" ]]; then _meta_fail "meta_get_field: usage"; fi
+  if [[ ! -f "$file" ]]; then _meta_fail "meta_get_field: file not found: $file"; fi
+  awk -F= -v k="$field" '$0 !~ /^#/ && $1==k { sub(/^[^=]*=/,""); print; exit }' "$file" || true
+}
+
+# -------------------------
+# meta_set_field - set a single key value (atomic)
+# Usage: meta_set_field <field> <value> <file>
+# -------------------------
+meta_set_field() {
+  local field="$1"; local value="$2"; local file="$3"
+  if [[ -z "$field" || -z "$file" ]]; then _meta_fail "meta_set_field: usage"; fi
+  if [[ ! -f "$file" ]]; then _meta_fail "meta_set_field: file not found: $file"; fi
+  declare -A up; up["$field"]="$value"
+  meta_write "$file" up
+}
+
+# -------------------------
+# meta_diff - show diff between current and last backup (or between two files)
+# Usage: meta_diff <file> [backupfile]
+# -------------------------
+meta_diff() {
+  local file="$1"; local bak="$2"
+  if [[ -z "$file" ]]; then _meta_fail "meta_diff: usage"; fi
+  if [[ -z "$bak" ]]; then
+    # find latest backup
+    local dir; dir="$(dirname "$file")"; local base; base="$(basename "$file")"
+    bak="$(ls -1 "${dir}/${base}.bak.*" 2>/dev/null | tail -n1 || true)"
+    if [[ -z "$bak" ]]; then
+      _meta_log INFO "meta_diff: nenhum backup encontrado para $file"
+      return 1
+    fi
   fi
-
-  mf_run_stage prepare
-  mf_run_stage configure
-  mf_run_stage build
-  mf_run_stage check
-  mf_run_stage install
-  mf_summary
+  if [[ ! -f "$bak" ]]; then _meta_fail "meta_diff: backup not found: $bak"; fi
+  _meta_log INFO "Mostrando diff: ${bak} -> ${file}"
+  diff -u "$bak" "$file" || true
 }
 
-# -----------------------
-# Create example metafile
-# -----------------------
-mf_create() {
-  local category="$1"; local name="$2"
-  [[ -z "$category" || -z "$name" ]] && fail "Uso: metafile.sh --create <categoria> <nome>"
-  local base="${SRC_DIR}/${category}/${name}"
-  safe_mkdir "$base"
-  local ini="${base}/${name}.ini"
-  cat > "$ini" <<EOF
-# Exemplo metafile
-name=${name}
-version=1.0.0
-description=Exemplo ${name}
-category=${category}
-arch=$(uname -m)
-urls=https://example.org/\${NAME}-\${VERSION}.tar.xz
-sha256sums=
-patches=
-patchsha256sums=
-envflags=CFLAGS="-O2 -pipe"
-hooks=${base}/hooks
-EOF
-  chmod 640 "$ini" || true
-  log INFO "Metafile de exemplo criado em: $ini"
+# -------------------------
+# meta_export_env - export meta fields into environment variables (useful for build.sh)
+# Usage: meta_export_env <file>
+# Exports: MF_NAME, MF_VERSION, MF_URLS, MF_SHA256S, MF_DEPENDS, MF_SOURCES, MF_PATCHES, MF_HOOKS, MF_BUILD_DEPS, MF_OPT_DEPS, MF_CATEGORY
+# -------------------------
+meta_export_env() {
+  local file="$1"
+  if [[ -z "$file" ]]; then _meta_fail "meta_export_env: usage"; fi
+  meta_load "$file" MF_ASSOC || return 2
+  export MF_NAME="${META_NAME:-}"
+  export MF_VERSION="${META_VERSION:-}"
+  export MF_URLS="${META_URLS:-}"
+  export MF_SHA256S="${META_SHA256S:-}"
+  export MF_DEPENDS="${META_DEPENDS:-}"
+  export MF_SOURCES="${META_SOURCES:-}"
+  export MF_PATCHES="${META_PATCHES:-}"
+  export MF_HOOKS="${META_HOOKS:-}"
+  export MF_BUILD_DEPS="${META_BUILD_DEPS:-}"
+  export MF_OPT_DEPS="${META_OPT_DEPS:-}"
+  export MF_CATEGORY="${META_CATEGORY:-}"
+  _meta_log DEBUG "meta_export_env: exported MF_* variables for $file"
 }
 
-# -----------------------
-# CLI
-# -----------------------
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  cmd="${1:-}"
-  case "$cmd" in
-    --load)
-      shift; mf_load "${1:-}" ; exit $? ;;
-    --fetch)
-      shift; mf_load "${1:-}"; mf_fetch_sources ; exit $? ;;
-    --patch)
-      shift; mf_load "${1:-}"; mf_apply_patches ; exit $? ;;
-    --build)
-      shift
-      mf_load "${1:-}" 
-      mf_fetch_sources
-      mf_apply_patches
-      mf_construction
-      exit $? ;;
-    --create)
-      shift; mf_create "$@" ; exit $? ;;
-    --uninstall)
-      shift; mf_load "${1:-}"; mf_uninstall ; exit $? ;;
-    --help|-h|"")
-      cat <<'EOF'
-metafile.sh - gerenciador de receitas com sandbox/hook integration
+# -------------------------
+# meta_clean_backups - remove backups older than retention policy across META_DIRS
+# Usage: meta_clean_backups [retention]
+# -------------------------
+meta_clean_backups() {
+  local retention="${1:-${META_BACKUP_RETENTION}}"
+  for d in ${META_DIRS}; do
+    if [[ -d "$d" ]]; then
+      while IFS= read -r bak; do
+        # collect backups per base file
+        local base; base="$(basename "${bak%%.bak.*}")"
+        local dir; dir="$(dirname "$bak")"
+        # list backups for base
+        local arr; IFS=$'\n' read -r -d '' -a arr < <(find "${dir}" -maxdepth 1 -type f -name "${base}.bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}' && printf '\0')
+        local cnt="${#arr[@]}"
+        if (( cnt > retention )); then
+          local toremove=$((cnt - retention))
+          for ((i=0;i<toremove;i++)); do
+            rm -f "${arr[i]}" || true
+            _meta_log DEBUG "meta_clean_backups removed ${arr[i]}"
+          done
+        fi
+      done < <(find "$d" -type f -name "*.bak.*" 2>/dev/null || true)
+    fi
+  done
+}
+
+# -------------------------
+# CLI dispatcher
+# -------------------------
+_print_help() {
+  cat <<EOF
+metafile.sh - gerenciador de metafiles (.ini)
 
 Uso:
-  metafile.sh --build <arquivo.ini>    Baixa (fetch) + patches + build (dentro do sandbox se disponível)
-  metafile.sh --fetch <arquivo.ini>    Baixa sources
-  metafile.sh --patch <arquivo.ini>    Baixa e aplica patches
-  metafile.sh --create <categoria> <nome>  Cria exemplo de metafile
-  metafile.sh --uninstall <arquivo.ini>  Remove pacote (simples)
-  metafile.sh --help
+  metafile.sh --create <category> <name> [dir]   : cria novo metafile template
+  metafile.sh --list [dir]                      : lista metafiles (por padrão META_DIRS)
+  metafile.sh --load <file>                     : carrega e mostra variáveis do metafile
+  metafile.sh --get <field> <file>              : retorna valor do campo
+  metafile.sh --set <field> <value> <file>      : atualiza campo (atômico)
+  metafile.sh --backup <file>                   : cria backup manual do metafile
+  metafile.sh --diff <file> [backup]            : mostra diff entre file e backup (último se não informado)
+  metafile.sh --validate <file>                 : valida metafile
+  metafile.sh --export-env <file>               : exporta variáveis MF_* no ambiente
+  metafile.sh --clean-backups [retention]       : limpa backups antigos
+  metafile.sh --help | -h
+Flags via ENV:
+  META_DEBUG=true    - ativa logs debug
+  META_SILENT=true   - suprime INFO/WARN (apenas ERROR)
 EOF
-      exit 0 ;;
+}
+
+# main CLI
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  if (( $# == 0 )); then _print_help; exit 0; fi
+  cmd="$1"; shift
+  case "$cmd" in
+    --create)
+      category="$1"; name="$2"; dir="${3:-}"
+      meta_create "$category" "$name" "$dir"
+      exit $?
+      ;;
+    --list)
+      dir="${1:-}"
+      meta_list "$dir"
+      exit $?
+      ;;
+    --load)
+      file="$1"
+      meta_load "$file" META_TMP
+      # display loaded values
+      printf 'NAME=%s\nVERSION=%s\nURLS=%s\nSHA256S=%s\nDEPENDS=%s\nCATEGORY=%s\nSOURCES=%s\nPATCHES=%s\nHOOKS=%s\nBUILD_DEPS=%s\nOPT_DEPS=%s\nDESCRIPTION=%s\n' \
+        "${META_NAME:-}" "${META_VERSION:-}" "${META_URLS:-}" "${META_SHA256S:-}" "${META_DEPENDS:-}" "${META_CATEGORY:-}" "${META_SOURCES:-}" "${META_PATCHES:-}" "${META_HOOKS:-}" "${META_BUILD_DEPS:-}" "${META_OPT_DEPS:-}" "${META_DESCRIPTION:-}"
+      exit 0
+      ;;
+    --get)
+      field="$1"; file="$2"
+      meta_get_field "$field" "$file"
+      exit $?
+      ;;
+    --set)
+      field="$1"; value="$2"; file="$3"
+      meta_set_field "$field" "$value" "$file"
+      exit $?
+      ;;
+    --backup)
+      file="$1"
+      meta_backup "$file"
+      exit $?
+      ;;
+    --diff)
+      file="$1"; bak="$2"
+      meta_diff "$file" "$bak"
+      exit $?
+      ;;
+    --validate)
+      file="$1"
+      meta_validate "$file"
+      exit $?
+      ;;
+    --export-env)
+      file="$1"
+      meta_export_env "$file"
+      exit $?
+      ;;
+    --clean-backups)
+      retention="${1:-}"
+      meta_clean_backups "$retention"
+      exit $?
+      ;;
+    --help|-h)
+      _print_help
+      exit 0
+      ;;
     *)
-      fail "Comando inválido. Use --help." ;;
+      _print_help
+      exit 2
+      ;;
   esac
 fi
 
-# Export functions for other scripts
-export -f mf_load mf_fetch_sources mf_apply_patches mf_prepare mf_configure mf_build mf_check mf_install mf_uninstall mf_construction mf_create mf_run_stage
-
-# End of file
+# Export core functions for sourcing by other scripts
+export -f meta_find meta_list meta_load meta_validate meta_backup meta_write meta_create meta_get_field meta_set_field meta_diff meta_export_env meta_clean_backups
