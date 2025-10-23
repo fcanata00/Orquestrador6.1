@@ -1,0 +1,62 @@
+# local dos metas para stages
+# /mnt/lfs/usr/src/repo/bootstrap/stage1.meta
+# stage1.meta - Definição de pacotes do Stage 1 (Toolchain Inicial)
+# Cada pacote possui chaves <nome>.<atributo>
+# A ordem de compilação é crítica.
+
+order=binutils, gcc, linux-headers, glibc, libstdcpp
+
+# --------------------------
+# Configuração de ambiente global do stage
+# Essas variáveis são exportadas no chroot para todos os builds deste stage
+stage.env=PATH=/usr/bin:/bin:/tools/bin;MAKEFLAGS=-j$(nproc);LFS_TGT=$(uname -m)-lfs-linux-gnu;LFS=/mnt/lfs
+
+# ========================================================================
+# BINUTILS
+# ========================================================================
+binutils.version=2.43.1
+binutils.url=https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+binutils.sha256=afccffb14b98c870a7ce7d3fce2c2bcb8b1dd6d9c1e79f8dfbc4e7a504ab1845
+binutils.patches=
+binutils.configure_flags=--prefix=/usr --with-sysroot=$LFS --target=$LFS_TGT --disable-nls --enable-gprofng=no --disable-werror
+binutils.category=base
+
+# ========================================================================
+# GCC (Pass 1)
+# ========================================================================
+gcc.version=14.2.0
+gcc.url=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+gcc.sha256=bf48f0f1ebef667db16d024055e294d9d89d7e99f1b582f5a5270b55f8c46bc9
+gcc.patches=
+gcc.configure_flags=--target=$LFS_TGT --prefix=/usr --with-glibc-version=2.40 --with-newlib --without-headers --enable-default-pie --enable-default-ssp --disable-nls --disable-shared --disable-multilib --disable-bootstrap --enable-languages=c,c++
+gcc.category=base
+
+# ========================================================================
+# LINUX HEADERS
+# ========================================================================
+linux-headers.version=6.10.5
+linux-headers.url=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+linux-headers.sha256=f3b97b41c0fa2358c8f06f51a59e443fe2fdc35c7c84d9c6c512f87c1416f876
+linux-headers.patches=
+linux-headers.build_script=make mrproper && make headers && find usr/include -name '.*' -delete && cp -rv usr/include $LFS/usr
+linux-headers.category=base
+
+# ========================================================================
+# GLIBC
+# ========================================================================
+glibc.version=2.40
+glibc.url=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
+glibc.sha256=cb2f7ff93eac25e9e5b38bff53dfdfb48c98ac9301f7d0e3d907f7ed3c3e39f9
+glibc.patches=
+glibc.configure_flags=--prefix=/usr --host=$LFS_TGT --build=$(../scripts/config.guess) --enable-kernel=3.2 --with-headers=/usr/include libc_cv_slibdir=/usr/lib
+glibc.category=base
+
+# ========================================================================
+# LIBSTDC++
+# ========================================================================
+libstdcpp.version=14.2.0
+libstdcpp.url=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+libstdcpp.sha256=bf48f0f1ebef667db16d024055e294d9d89d7e99f1b582f5a5270b55f8c46bc9
+libstdcpp.patches=
+libstdcpp.build_script=cd libstdc++-v3 && mkdir -pv build && cd build && ../configure --host=$LFS_TGT --build=$(../scripts/config.guess) --prefix=/usr --disable-multilib --disable-nls --disable-libstdcxx-pch --with-gxx-include-dir=/usr/include/c++/14.2.0 && make -j$(nproc) && make install
+libstdcpp.category=base
