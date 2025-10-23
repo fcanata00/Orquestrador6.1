@@ -333,4 +333,3 @@ fi
 # Export functions for sourcing
 # -------------------------
 export -f hooks_init hooks_validate hooks_list hooks_run hooks_summary hooks_cleanup _hooks_run_file
-```0
